@@ -1,0 +1,24 @@
+# Grafana - Data Source Provisioning
+# 
+# This automatically configures TimescaleDB as a data source when Grafana starts.
+# No manual configuration needed.
+
+apiVersion: 1
+
+datasources:
+  - name: TimescaleDB
+    type: postgres
+    url: timescaledb:5432
+    database: cryptobot
+    user: cryptobot
+    secureJsonData:
+      password: cryptobot_dev
+    jsonData:
+      sslmode: disable
+      maxOpenConns: 10
+      maxIdleConns: 10
+      connMaxLifetime: 14400
+      postgresVersion: 1400
+      timescaledb: true
+    isDefault: true
+    editable: true

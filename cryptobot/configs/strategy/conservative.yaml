@@ -1,0 +1,30 @@
+# CryptoBot Strategy Configuration
+# Conservative settings for lower risk
+
+pair: XBTUSD
+pairs:
+  - XBTUSD
+
+# Position Sizing - Conservative
+kelly_fraction: 0.15         # Lower Kelly for less volatility
+max_position: 0.20           # Max 20% per position
+min_position: 0.005          # Min 0.5%
+p_threshold: 0.55            # Higher threshold = fewer trades
+
+# Regime Multipliers - More cautious
+regime_multipliers:
+  0: 0.5
+  1: 0.8
+  2: 0.3
+  3: 0.1                     # Almost no trading in crisis
+
+# MA Score Multipliers - Require stronger trend
+ma_multipliers:
+  0: 0.2                     # Minimal trading when all bearish
+  1: 0.4
+  2: 0.6
+  3: 1.0
+
+# Volatility Scaling
+use_vol_scaling: false
+target_vol: 0.80

@@ -1,0 +1,37 @@
+# CryptoBot Features Configuration
+# Feature engineering settings
+
+# Feature List
+# These are the validated features from empirical testing
+features:
+  # Trend features
+  - ma_score                  # Composite 0-3 score
+  - price_vs_sma_6
+  - price_vs_sma_24
+  - price_vs_sma_72
+  
+  # Regime features
+  - regime_binseg             # Structural regime (0/1)
+  - regime_msm                # Momentum regime (0/1)
+  - regime_hybrid_simple      # Combined 4-state regime
+  
+  # Volatility features
+  - rolling_vol_168h          # Weekly rolling volatility
+  - garch_vol_simple          # GARCH volatility forecast
+
+# Target Settings
+target_horizon: 24           # Predict 24 hours ahead
+target_type: binary          # 'binary' (up/down) or 'return'
+
+# Moving Average Periods (in hours)
+ma_periods:
+  - 6                        # ~6 hours (intraday)
+  - 24                       # ~1 day
+  - 72                       # ~3 days
+
+# Volatility Settings
+vol_lookback: 168            # 7 days (168 hours)
+
+# Regime Detection
+binseg_window: 168           # BinSeg rolling window
+msm_window: 24               # MSM rolling window

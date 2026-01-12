@@ -1,0 +1,26 @@
+# CryptoBot Risk Configuration
+# Default settings from strategy document
+
+# Circuit Breakers
+# P&L-based trading halts
+daily_loss_limit: -0.05      # -5% daily -> reduce positions 50%
+weekly_loss_limit: -0.10     # -10% weekly -> pause new trades
+monthly_loss_limit: -0.15    # -15% monthly -> flatten all
+max_drawdown: -0.25          # -25% peak drawdown -> full stop
+
+# Stop Losses
+atr_multiplier: 2.0          # ATR-based: entry - (ATR × 2.0)
+garch_multiplier: 2.5        # GARCH-based: entry - (vol × 2.5 × entry)
+signal_threshold: 0.35       # Signal-based: exit if P(up) < 0.35
+max_loss_per_trade: 0.03     # Maximum 3% loss per position
+
+# Trailing Stops
+use_trailing_stops: false
+trailing_stop_pct: 0.02      # 2% trailing stop
+
+# Position Limits
+max_position_pct: 0.30       # Max 30% per position
+max_total_exposure: 3.0      # Max 300% total exposure (3x leverage)
+max_leverage: 3.0            # Max leverage allowed
+max_correlated_exposure: 0.50  # Max 50% in correlated assets
+correlation_threshold: 0.80  # Pairs with corr > 0.8 are "correlated"

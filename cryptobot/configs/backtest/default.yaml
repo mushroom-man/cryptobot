@@ -1,0 +1,19 @@
+# CryptoBot Backtest Configuration
+# Execution simulation settings
+
+# Capital
+initial_capital: 100000.0    # Starting capital in USD
+
+# Execution Costs
+slippage_bps: 10.0           # Slippage in basis points (10 = 0.1%)
+commission_bps: 10.0         # Commission in basis points
+
+# Trading
+min_trade_threshold: 0.01    # Minimum position change to trigger trade (1%)
+
+# Date Range (optional - null = use all data)
+start_date: null
+end_date: null
+
+# Progress Display
+show_progress: true

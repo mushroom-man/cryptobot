@@ -1,0 +1,102 @@
+# CryptoBot Platform - Docker Compose
+# 
+# Usage:
+#   Start all services:   docker-compose up -d
+#   Stop all services:    docker-compose down
+#   View logs:            docker-compose logs -f
+#   Rebuild after code:   docker-compose up -d --build
+#
+# Services:
+#   - timescaledb: PostgreSQL with time-series extensions (port 5432)
+#   - cryptobot:   Python trading application
+#   - grafana:     Dashboards and visualization (port 3000)
+
+version: '3.8'
+
+services:
+  # ===========================================================================
+  # TimescaleDB - Time-series database
+  # ===========================================================================
+  timescaledb:
+    image: timescale/timescaledb:latest-pg14
+    container_name: cryptobot-db
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cryptobot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cryptobot_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-cryptobot}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cryptobot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # CryptoBot - Python trading application
+  # ===========================================================================
+  cryptobot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cryptobot-app
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER:-cryptobot}:${POSTGRES_PASSWORD:-cryptobot_dev}@timescaledb:5432/${POSTGRES_DB:-cryptobot}
+      
+      # Exchange API (loaded from .env)
+      KRAKEN_API_KEY: ${KRAKEN_API_KEY:-}
+      KRAKEN_API_SECRET: ${KRAKEN_API_SECRET:-}
+      
+      # App settings
+      ENV: ${ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./cryptobot:/app/cryptobot:ro
+      - ./config:/app/config:ro
+      - ./data/csv:/app/data/csv:ro
+      - ./models:/app/models
+      - ./logs:/app/logs
+    # Default command - can be overridden
+    command: python -m cryptobot.main
+
+  # ===========================================================================
+  # Grafana - Dashboards and visualization
+  # ===========================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: cryptobot-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-piechart-panel
+    volumes:
+      - ./data/grafana:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - timescaledb
+
+# ===========================================================================
+# Volumes (named volumes for persistence)
+# ===========================================================================
+volumes:
+  postgres_data:
+  grafana_data:
+
+# ===========================================================================
+# Networks
+# ===========================================================================
+networks:
+  default:
+    name: cryptobot-network

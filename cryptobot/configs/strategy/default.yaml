@@ -1,0 +1,46 @@
+# CryptoBot Strategy Configuration
+# Default settings based on empirical testing
+
+# Trading pair(s)
+pair: XBTUSD
+pairs:
+  - XBTUSD
+  - ETHUSD
+  - SOLUSD
+  - LINKUSD
+  - AVAXUSD
+  - LTCUSD
+
+# Position Sizing (Kelly Criterion)
+kelly_fraction: 0.25      # Quarter Kelly for smoother equity curve
+max_position: 0.30        # Maximum 30% of equity per position
+min_position: 0.005       # Minimum 0.5% (below = no trade) - lowered for crypto
+p_threshold: 0.50         # Probability threshold (>0.5 = long, <0.5 = short)
+
+# Regime Multipliers
+# From hybrid BinSeg + MSM regime detection
+# State 0: Calm/Calm (quiet consolidation)
+# State 1: Calm/Volatile (breakout - best)
+# State 2: Volatile/Calm (recovery)
+# State 3: Volatile/Volatile (crisis)
+regime_multipliers:
+  0: 0.8
+  1: 1.0
+  2: 0.5
+  3: 0.3
+
+# MA Score Multipliers
+# Score based on price vs SMA(6), SMA(24), SMA(72)
+# Score 0: All bearish, Score 3: All bullish
+# Note: For shorts, score is inverted (0 becomes 3, etc.)
+# Raised floor to prevent position crushing when combined with Kelly
+ma_multipliers:
+  0: 0.3
+  1: 0.5
+  2: 0.7
+  3: 1.0
+
+# Volatility Scaling
+# Disabled for crypto - BTC vol (~80-100% annualized) vs stocks (~20%)
+use_vol_scaling: false
+target_vol: 0.80          # Crypto-appropriate target (if enabled)

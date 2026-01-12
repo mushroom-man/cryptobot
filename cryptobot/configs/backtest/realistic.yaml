@@ -1,0 +1,16 @@
+# CryptoBot Backtest Configuration
+# Realistic settings matching Kraken exchange
+
+# Capital
+initial_capital: 100000.0
+
+# Execution Costs - Kraken-realistic
+slippage_bps: 5.0            # Crypto has tight spreads
+commission_bps: 26.0         # Kraken taker fee ~0.26%
+
+# Trading
+min_trade_threshold: 0.01
+
+# Date Range
+start_date: null
+end_date: null

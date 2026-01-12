@@ -1,0 +1,25 @@
+# CryptoBot Model Configuration
+# Machine learning model settings
+
+# Model Type
+# Options: 'logistic', 'random_forest', 'xgboost'
+model_type: random_forest
+
+# Random Forest Parameters
+n_estimators: 100
+max_depth: 10
+min_samples_split: 10
+min_samples_leaf: 5
+
+# Logistic Regression Parameters
+C: 1.0                       # Inverse regularization
+
+# XGBoost Parameters
+learning_rate: 0.1
+subsample: 0.8
+colsample_bytree: 0.8
+
+# Training Settings
+test_size: 0.2               # 20% for test
+val_size: 0.1                # 10% for validation
+random_state: 42             # Reproducibility

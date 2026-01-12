@@ -1,0 +1,25 @@
+# CryptoBot Risk Configuration
+# Conservative settings - tighter limits
+
+# Circuit Breakers - Tighter limits
+daily_loss_limit: -0.03      # -3% daily
+weekly_loss_limit: -0.07     # -7% weekly
+monthly_loss_limit: -0.10    # -10% monthly
+max_drawdown: -0.15          # -15% max drawdown
+
+# Stop Losses - Tighter stops
+atr_multiplier: 1.5
+garch_multiplier: 2.0
+signal_threshold: 0.40       # Exit sooner on weak signal
+max_loss_per_trade: 0.02     # Max 2% per trade
+
+# Trailing Stops - Enabled
+use_trailing_stops: true
+trailing_stop_pct: 0.015     # 1.5% trailing
+
+# Position Limits - More conservative
+max_position_pct: 0.20
+max_total_exposure: 2.0      # Max 200% exposure
+max_leverage: 2.0
+max_correlated_exposure: 0.30
+correlation_threshold: 0.70

@@ -1,0 +1,32 @@
+# CryptoBot Strategy Configuration
+# Aggressive settings for higher returns (and risk)
+
+pair: XBTUSD
+pairs:
+  - XBTUSD
+  - ETHUSD
+  - SOLUSD
+
+# Position Sizing - Aggressive
+kelly_fraction: 0.40         # Higher Kelly
+max_position: 0.50           # Max 50% per position
+min_position: 0.005          # Min 0.5%
+p_threshold: 0.50            # Standard threshold
+
+# Regime Multipliers - More aggressive
+regime_multipliers:
+  0: 1.0
+  1: 1.0
+  2: 0.7
+  3: 0.5                     # Still trade in crisis
+
+# MA Score Multipliers - Trade more often
+ma_multipliers:
+  0: 0.4
+  1: 0.6
+  2: 0.8
+  3: 1.0
+
+# Volatility Scaling
+use_vol_scaling: false
+target_vol: 0.80

@@ -1,0 +1,48 @@
+# Docker runtime data - NEVER commit (root level only)
+/data/
+
+# Secrets
+.env
+*.env
+
+# Data files
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Spyder
+.spyproject/
+*.spydata
+
+# R
+.Rhistory
+.RData
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Archives
+*.zip
+
+# Temp files
+tree.txt
