@@ -21,17 +21,18 @@ Usage:
 """
 
 import sys
-sys.path.insert(0, 'D:/cryptobot_docker')
+sys.path.insert(0, 'D:/cryptobot_docker/cryptobot/data')
 
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
-from itertools import combinations, product
+from itertools import product
 import warnings
 warnings.filterwarnings('ignore')
+from itertools import combinations
 
-from cryptobot.datasources.database import Database
+from database import Database
 
 
 # =============================================================================

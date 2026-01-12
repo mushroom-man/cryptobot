@@ -23,7 +23,7 @@ Usage:
 """
 
 import sys
-sys.path.insert(0, 'D:/cryptobot_docker')
+sys.path.insert(0, 'D:/cryptobot_docker/cryptobot/data')
 
 import pandas as pd
 import numpy as np
@@ -33,7 +33,7 @@ from itertools import combinations, product
 import warnings
 warnings.filterwarnings('ignore')
 
-from cryptobot.datasources.database import Database
+from database import Database
 
 
 # =============================================================================
