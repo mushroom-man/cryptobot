@@ -28,11 +28,10 @@ except ImportError:
     pass  # dotenv not installed, use environment variables directly
 
 # Database connection
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", 
-    "postgresql://cryptobot:cryptobot_dev@localhost:5432/cryptobot"
-)
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL is None:
+    raise ValueError("DATABASE_URL environment variable is not set. Check your .env file.")
 
 def detect_format(df: pd.DataFrame) -> str:
     """

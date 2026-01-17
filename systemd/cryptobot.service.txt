@@ -1,0 +1,15 @@
+[Unit]
+Description=CryptoBot Paper Trading Runner
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=pi
+WorkingDirectory=/home/pi/cryptobot
+ExecStart=/usr/bin/python3 -m apps.live.runner --hourly
+StandardOutput=append:/home/pi/cryptobot/logs/runner.log
+StandardError=append:/home/pi/cryptobot/logs/runner.log
+
+[Install]
+WantedBy=multi-user.target

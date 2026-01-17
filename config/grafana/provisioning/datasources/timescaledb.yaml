@@ -8,11 +8,11 @@ apiVersion: 1
 datasources:
   - name: TimescaleDB
     type: postgres
-    url: timescaledb:5432
+    url: cryptobot-db:5432
     database: cryptobot
     user: cryptobot
     secureJsonData:
-      password: cryptobot_dev
+      password: Carljung#3001
     jsonData:
       sslmode: disable
       maxOpenConns: 10

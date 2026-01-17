@@ -31,12 +31,9 @@ except ImportError:
     pass  # dotenv not installed, use environment variables directly
 
 # Database connection
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", 
-    "postgresql://cryptobot:cryptobot_dev@localhost:5432/cryptobot"
-)
-
-# Kraken API base URL
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL is None:
+    raise ValueError("DATABASE_URL environment variable is not set. Check your .env file.")# Kraken API base URL
 KRAKEN_API_URL = "https://api.kraken.com/0/public"
 
 # Kraken pair name mapping (display name -> Kraken API name)
@@ -52,6 +49,10 @@ PAIR_MAPPING = {
     "AVAXUSD": "AVAXUSD",
     "DOTUSD": "DOTUSD",
     "LTCUSD": "XLTCZUSD",
+    "XLMUSD": "XXLMZUSD",
+    "ZECUSD": "XZECZUSD", 
+    "ETCUSD": "XETCZUSD",
+    "XMRUSD": "XXMRZUSD",
 }
 
 # Reverse mapping
@@ -286,8 +287,8 @@ class KrakenAPI:
                 last_ts = result.scalar()
                 
                 if last_ts:
+                    last_ts = pd.to_datetime(last_ts).tz_localize(None)
                     df_to_insert = df_to_insert[df_to_insert['timestamp'] > last_ts]
-                    print(f"Filtering to {len(df_to_insert)} new rows after {last_ts}")
         
         if len(df_to_insert) == 0:
             print("No new data to insert after filtering")

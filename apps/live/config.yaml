@@ -1,0 +1,62 @@
+# CryptoBot Paper Trading Configuration
+# =====================================
+
+# Trading pairs to monitor
+pairs:
+  - XBTUSD
+  - ETHUSD
+  - XLMUSD
+  - ZECUSD
+  - ETCUSD
+  - XMRUSD
+  - ADAUSD
+
+# Strategy settings
+strategy:
+  name: "16state_directional"
+  min_training_months: 12
+  use_ma72_filter: true
+
+# Position sizing
+position:
+  initial_capital: 100000.0
+  max_position_pct: 0.25      # Max 25% per pair
+  min_trade_size: 100.0
+
+# Risk management
+risk:
+  max_drawdown: 0.20          # 20% max drawdown
+  target_volatility: 0.40
+
+# Execution
+execution:
+  mode: "paper"               # paper or live
+  trading_cost_bps: 20        # 20 bps = 0.20%
+
+# Data settings
+data:
+  lookback_days: 730          # Days of history needed for signals
+
+# Logging
+logging:
+  level: "INFO"
+  file: "logs/paper_trading.log"
+
+# Notifications
+notifications:
+  enabled: false
+  
+  # Pushover (mobile push notifications)
+  pushover:
+    - user_key: "your_pushover_user_key"
+      api_token: "your_pushover_api_token"
+  
+  # Email
+  email:
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    sender: "your_email@gmail.com"
+    password: "your_gmail_app_password"
+    recipients:
+      - "recipient1@gmail.com"
+      - "recipient2@gmail.com"

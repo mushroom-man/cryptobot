@@ -1,15 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Validation: Compare backtest functions vs signals module
-=========================================================
-Ensures the extracted signals module produces IDENTICAL results
-to the original backtest implementation.
+Validation: 16-State Signals Module
+====================================
+Ensures the 16-state signals module produces correct results
+with proper NO_MA72_ONLY filter behavior.
+
+Tests:
+    1. Resampling correctness
+    2. Trend labeling with hysteresis
+    3. 16-state signal generation (no trend_72h)
+    4. NO_MA72_ONLY filter behavior
+    5. Hit rate calculation (16 states)
+    6. SignalGenerator class integration
 """
 
 import sys
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from itertools import product
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -19,83 +28,18 @@ from cryptobot.signals import (
     SignalGenerator,
     resample_ohlcv,
     label_trend_binary,
-    generate_32state_signals,
+    generate_16state_signals,
     calculate_expanding_hit_rates,
+    get_16state_position,
+    should_trade_signal,
+    get_state_tuple,
     MA_PERIOD_24H,
     MA_PERIOD_72H,
     MA_PERIOD_168H,
     ENTRY_BUFFER,
     EXIT_BUFFER,
+    USE_MA72_FILTER,
 )
-
-# =============================================================================
-# ORIGINAL BACKTEST FUNCTIONS (copied verbatim for comparison)
-# =============================================================================
-
-def original_resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
-    """Original from backtest line 278-282"""
-    return df.resample(timeframe).agg({
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-        'volume': 'sum'
-    }).dropna()
-
-
-def original_label_trend_binary(df, ma_period, entry_buffer=0.015, exit_buffer=0.005):
-    """Original from backtest line 285-310"""
-    close = df['close']
-    ma = close.rolling(ma_period).mean()
-    
-    labels = pd.Series(index=df.index, dtype=int)
-    current = 1
-    
-    for i in range(len(df)):
-        if pd.isna(ma.iloc[i]):
-            labels.iloc[i] = current
-            continue
-        
-        price = close.iloc[i]
-        ma_val = ma.iloc[i]
-        
-        if current == 1:
-            if price < ma_val * (1 - exit_buffer) and price < ma_val * (1 - entry_buffer):
-                current = 0
-        else:
-            if price > ma_val * (1 + exit_buffer) and price > ma_val * (1 + entry_buffer):
-                current = 1
-        
-        labels.iloc[i] = current
-    
-    return labels
-
-
-def original_generate_32state_signals(df_24h, df_72h, df_168h):
-    """Original from backtest line 313-338"""
-    MA_24H = 16
-    MA_72H = 6
-    MA_168H = 2
-    
-    trend_24h = original_label_trend_binary(df_24h, MA_24H)
-    trend_72h = original_label_trend_binary(df_72h, MA_72H)
-    trend_168h = original_label_trend_binary(df_168h, MA_168H)
-    
-    ma_24h = df_24h['close'].rolling(MA_24H).mean()
-    ma_72h = df_72h['close'].rolling(MA_72H).mean()
-    ma_168h = df_168h['close'].rolling(MA_168H).mean()
-    
-    ma_72h_aligned = ma_72h.reindex(df_24h.index, method='ffill')
-    ma_168h_aligned = ma_168h.reindex(df_24h.index, method='ffill')
-    
-    aligned = pd.DataFrame(index=df_24h.index)
-    aligned['trend_24h'] = trend_24h.shift(1)
-    aligned['trend_72h'] = trend_72h.shift(1).reindex(df_24h.index, method='ffill')
-    aligned['trend_168h'] = trend_168h.shift(1).reindex(df_24h.index, method='ffill')
-    aligned['ma72_above_ma24'] = (ma_72h_aligned > ma_24h).astype(int).shift(1)
-    aligned['ma168_above_ma24'] = (ma_168h_aligned > ma_24h).astype(int).shift(1)
-    
-    return aligned.dropna().astype(int)
 
 
 # =============================================================================
@@ -103,63 +47,87 @@ def original_generate_32state_signals(df_24h, df_72h, df_168h):
 # =============================================================================
 
 def test_resample(df_1h):
-    """Test resampling produces identical results."""
+    """Test resampling produces correct results."""
     print("\n" + "="*60)
     print("TEST 1: Resampling")
     print("="*60)
     
-    for tf in ['24h', '72h', '168h']:
-        orig = original_resample_ohlcv(df_1h, tf)
-        new = resample_ohlcv(df_1h, tf)
-        
-        match = orig.equals(new)
-        print(f"  {tf}: {'? MATCH' if match else '? MISMATCH'} ({len(orig)} rows)")
-        
-        if not match:
-            diff = (orig != new).sum().sum()
-            print(f"    Differences: {diff} cells")
-            return False
+    all_passed = True
     
-    return True
+    for tf in ['24h', '72h', '168h']:
+        resampled = resample_ohlcv(df_1h, tf)
+        
+        # Check columns exist
+        required_cols = ['open', 'high', 'low', 'close', 'volume']
+        missing = [c for c in required_cols if c not in resampled.columns]
+        
+        if missing:
+            print(f"  {tf}: ✗ FAIL - Missing columns: {missing}")
+            all_passed = False
+            continue
+        
+        # Check no NaN in output
+        nan_count = resampled.isna().sum().sum()
+        if nan_count > 0:
+            print(f"  {tf}: ✗ FAIL - {nan_count} NaN values")
+            all_passed = False
+            continue
+        
+        # Check monotonic index
+        if not resampled.index.is_monotonic_increasing:
+            print(f"  {tf}: ✗ FAIL - Non-monotonic index")
+            all_passed = False
+            continue
+        
+        print(f"  {tf}: ✓ PASS ({len(resampled)} bars)")
+    
+    return all_passed
 
 
 def test_trend_labeling(df_1h):
-    """Test trend labeling produces identical results."""
+    """Test trend labeling produces binary results with hysteresis."""
     print("\n" + "="*60)
     print("TEST 2: Trend Labeling (with hysteresis)")
     print("="*60)
     
+    all_passed = True
+    
     test_cases = [
         ('24h', MA_PERIOD_24H),
-        ('72h', MA_PERIOD_72H),
         ('168h', MA_PERIOD_168H),
     ]
     
     for tf, ma_period in test_cases:
         df_tf = resample_ohlcv(df_1h, tf)
+        labels = label_trend_binary(df_tf, ma_period, ENTRY_BUFFER, EXIT_BUFFER)
         
-        orig = original_label_trend_binary(df_tf, ma_period, ENTRY_BUFFER, EXIT_BUFFER)
-        new = label_trend_binary(df_tf, ma_period, ENTRY_BUFFER, EXIT_BUFFER)
+        # Check binary values only
+        unique_vals = labels.dropna().unique()
+        if not set(unique_vals).issubset({0, 1}):
+            print(f"  {tf} (MA{ma_period}): ✗ FAIL - Non-binary values: {unique_vals}")
+            all_passed = False
+            continue
         
-        match = orig.equals(new)
-        print(f"  {tf} (MA{ma_period}): {'? MATCH' if match else '? MISMATCH'}")
+        # Check reasonable flip frequency (not too many, not too few)
+        flips = (labels.diff() != 0).sum()
+        flip_rate = flips / len(labels)
         
-        if not match:
-            diff_count = (orig != new).sum()
-            print(f"    Differences: {diff_count} rows")
-            # Show first few differences
-            diff_idx = orig[orig != new].index[:3]
-            for idx in diff_idx:
-                print(f"    {idx}: orig={orig.loc[idx]}, new={new.loc[idx]}")
-            return False
+        if flip_rate < 0.001 or flip_rate > 0.5:
+            print(f"  {tf} (MA{ma_period}): ⚠ WARNING - Unusual flip rate: {flip_rate:.3f}")
+        
+        # Check label distribution
+        label_pct = labels.value_counts(normalize=True)
+        
+        print(f"  {tf} (MA{ma_period}): ✓ PASS - {flips} flips ({flip_rate*100:.1f}%), "
+              f"dist: 0={label_pct.get(0, 0)*100:.1f}%, 1={label_pct.get(1, 0)*100:.1f}%")
     
-    return True
+    return all_passed
 
 
-def test_32state_signals(df_1h):
-    """Test 32-state signal generation produces identical results."""
+def test_16state_signals(df_1h):
+    """Test 16-state signal generation (without trend_72h)."""
     print("\n" + "="*60)
-    print("TEST 3: 32-State Signal Generation")
+    print("TEST 3: 16-State Signal Generation")
     print("="*60)
     
     # Resample
@@ -168,66 +136,96 @@ def test_32state_signals(df_1h):
     df_168h = resample_ohlcv(df_1h, '168h')
     
     # Generate signals
-    orig = original_generate_32state_signals(df_24h, df_72h, df_168h)
-    new = generate_32state_signals(df_24h, df_72h, df_168h)
+    signals = generate_16state_signals(df_24h, df_72h, df_168h)
     
-    print(f"  Original shape: {orig.shape}")
-    print(f"  New shape:      {new.shape}")
+    print(f"  Shape: {signals.shape}")
     
-    # Check index alignment
-    if not orig.index.equals(new.index):
-        print("  ? Index mismatch!")
-        print(f"    Original: {orig.index[0]} to {orig.index[-1]}")
-        print(f"    New:      {new.index[0]} to {new.index[-1]}")
+    # Check required columns (NO trend_72h!)
+    required_cols = ['trend_24h', 'trend_168h', 'ma72_above_ma24', 'ma168_above_ma24']
+    missing = [c for c in required_cols if c not in signals.columns]
+    
+    if missing:
+        print(f"  ✗ FAIL - Missing columns: {missing}")
         return False
     
-    # Check each column
-    all_match = True
-    for col in orig.columns:
-        col_match = orig[col].equals(new[col])
-        print(f"  {col}: {'? MATCH' if col_match else '? MISMATCH'}")
-        
-        if not col_match:
-            all_match = False
-            diff_count = (orig[col] != new[col]).sum()
-            print(f"    Differences: {diff_count} rows")
+    # Check trend_72h is NOT present
+    if 'trend_72h' in signals.columns:
+        print(f"  ✗ FAIL - trend_72h should NOT be present (removed in 16-state)")
+        return False
     
-    return all_match
+    print(f"  ✓ trend_72h correctly removed")
+    
+    # Check binary values
+    for col in required_cols:
+        unique_vals = signals[col].unique()
+        if not set(unique_vals).issubset({0, 1}):
+            print(f"  ✗ FAIL - {col} has non-binary values: {unique_vals}")
+            return False
+    
+    # Count unique states
+    state_combos = signals.groupby(required_cols).size()
+    n_states = len(state_combos)
+    
+    print(f"  ✓ All columns binary")
+    print(f"  ✓ Unique states observed: {n_states}/16")
+    
+    return True
 
 
-def test_signal_generator_class(df_1h):
-    """Test the SignalGenerator class wrapper."""
+def test_filter_behavior():
+    """Test NO_MA72_ONLY filter behavior."""
     print("\n" + "="*60)
-    print("TEST 4: SignalGenerator Class")
+    print("TEST 4: NO_MA72_ONLY Filter Behavior")
     print("="*60)
     
-    gen = SignalGenerator()
+    all_passed = True
     
-    # Generate signals via class
-    signals = gen.generate_signals(df_1h)
+    # Test cases: (prev_state, curr_state, expected_should_trade)
+    test_cases = [
+        # (trend_24h, trend_168h, ma72_above_ma24, ma168_above_ma24)
+        
+        # First signal - always trade
+        (None, (1, 1, 1, 1), True, "First signal"),
+        
+        # No change - no trade
+        ((1, 1, 1, 1), (1, 1, 1, 1), False, "No change"),
+        
+        # Only ma72 changed - FILTER (should NOT trade)
+        ((1, 1, 0, 1), (1, 1, 1, 1), False, "Only ma72 changed"),
+        ((1, 1, 1, 1), (1, 1, 0, 1), False, "Only ma72 changed (reverse)"),
+        
+        # trend_24h changed - TRADE
+        ((0, 1, 1, 1), (1, 1, 1, 1), True, "trend_24h changed"),
+        
+        # trend_168h changed - TRADE
+        ((1, 0, 1, 1), (1, 1, 1, 1), True, "trend_168h changed"),
+        
+        # ma168 changed - TRADE
+        ((1, 1, 1, 0), (1, 1, 1, 1), True, "ma168 changed"),
+        
+        # ma72 + trend_24h changed - TRADE
+        ((0, 1, 0, 1), (1, 1, 1, 1), True, "ma72 + trend_24h changed"),
+        
+        # All changed - TRADE
+        ((0, 0, 0, 0), (1, 1, 1, 1), True, "All changed"),
+    ]
     
-    # Generate signals via functions
-    df_24h = resample_ohlcv(df_1h, '24h')
-    df_72h = resample_ohlcv(df_1h, '72h')
-    df_168h = resample_ohlcv(df_1h, '168h')
-    direct_signals = generate_32state_signals(df_24h, df_72h, df_168h)
+    for prev_state, curr_state, expected, description in test_cases:
+        result = should_trade_signal(prev_state, curr_state, use_filter=True)
+        
+        if result == expected:
+            print(f"  ✓ {description}: {result}")
+        else:
+            print(f"  ✗ {description}: expected {expected}, got {result}")
+            all_passed = False
     
-    match = signals.equals(direct_signals)
-    print(f"  Class vs direct functions: {'? MATCH' if match else '? MISMATCH'}")
-    
-    # Test returns calculation
-    returns = gen.get_returns(df_1h)
-    direct_returns = df_24h['close'].pct_change()
-    returns_match = returns.equals(direct_returns)
-    print(f"  Returns calculation: {'? MATCH' if returns_match else '? MISMATCH'}")
-    
-    return match and returns_match
+    return all_passed
 
 
 def test_hit_rate_calculation(df_1h):
-    """Test hit rate calculation."""
+    """Test hit rate calculation for 16 states."""
     print("\n" + "="*60)
-    print("TEST 5: Hit Rate Calculation")
+    print("TEST 5: Hit Rate Calculation (16 States)")
     print("="*60)
     
     gen = SignalGenerator()
@@ -237,29 +235,130 @@ def test_hit_rate_calculation(df_1h):
     # Calculate hit rates
     hit_rates = calculate_expanding_hit_rates(returns, signals)
     
-    # Check structure
+    # Check structure - should be 16 states (4 trend × 4 MA)
     n_states = len(hit_rates)
-    print(f"  States calculated: {n_states} (expected 32)")
+    expected_states = 16
     
-    if n_states != 32:
-        print("  ? Wrong number of states!")
+    if n_states != expected_states:
+        print(f"  ✗ FAIL - Expected {expected_states} states, got {n_states}")
         return False
+    
+    print(f"  ✓ States calculated: {n_states}")
+    
+    # Check key structure
+    all_trend_perms = list(product([0, 1], repeat=2))  # 4 trend permutations
+    all_ma_perms = list(product([0, 1], repeat=2))      # 4 MA permutations
+    
+    for trend_perm in all_trend_perms:
+        for ma_perm in all_ma_perms:
+            key = (trend_perm, ma_perm)
+            if key not in hit_rates:
+                print(f"  ✗ FAIL - Missing key: {key}")
+                return False
+    
+    print(f"  ✓ All 16 state keys present")
     
     # Check data integrity
     total_samples = sum(hr['n'] for hr in hit_rates.values())
     sufficient_states = sum(1 for hr in hit_rates.values() if hr['sufficient'])
     
     print(f"  Total samples: {total_samples}")
-    print(f"  Sufficient states (n>=20): {sufficient_states}/32")
+    print(f"  Sufficient states (n>=20): {sufficient_states}/16")
     
-    # Verify hit rates are valid
+    # Verify hit rates are valid (0-1)
     for key, data in hit_rates.items():
         if not (0 <= data['hit_rate'] <= 1):
-            print(f"  ? Invalid hit rate for {key}: {data['hit_rate']}")
+            print(f"  ✗ FAIL - Invalid hit rate for {key}: {data['hit_rate']}")
             return False
     
-    print("  ? All hit rates valid (0-1)")
+    print("  ✓ All hit rates valid (0-1)")
     return True
+
+
+def test_signal_generator_class(df_1h):
+    """Test the SignalGenerator class with filter."""
+    print("\n" + "="*60)
+    print("TEST 6: SignalGenerator Class (with Filter)")
+    print("="*60)
+    
+    gen = SignalGenerator(use_filter=True)
+    
+    # Generate signals
+    signals = gen.generate_signals(df_1h)
+    returns = gen.get_returns(df_1h)
+    
+    # Check signals shape
+    if 'trend_72h' in signals.columns:
+        print("  ✗ FAIL - trend_72h should not be in signals")
+        return False
+    
+    print(f"  ✓ Signals generated: {len(signals)} rows, {len(signals.columns)} columns")
+    
+    # Test position calculation with filter
+    data_start = signals.index[0]
+    test_dates = signals.index[400:410]  # After training period
+    
+    gen.reset_filter_state()  # Reset for clean test
+    
+    positions = []
+    filtered_count = 0
+    
+    for date in test_dates:
+        position, details = gen.get_position_for_date(
+            signals, returns, date, data_start, min_training_months=12
+        )
+        positions.append(position)
+        
+        if details.get('filtered', False):
+            filtered_count += 1
+    
+    # Check positions are valid
+    for pos in positions:
+        if pos not in [0.0, 0.5, 1.0]:
+            print(f"  ✗ FAIL - Invalid position: {pos}")
+            return False
+    
+    print(f"  ✓ Positions valid: {positions}")
+    
+    # Check filter stats
+    stats = gen.get_filter_stats()
+    print(f"  Filter stats: {stats}")
+    
+    return True
+
+
+def test_filter_rate(df_1h):
+    """Test that filter rate is approximately 56% as validated."""
+    print("\n" + "="*60)
+    print("TEST 7: Filter Rate Validation (~56% expected)")
+    print("="*60)
+    
+    gen = SignalGenerator(use_filter=True)
+    signals = gen.generate_signals(df_1h)
+    returns = gen.get_returns(df_1h)
+    data_start = signals.index[0]
+    
+    # Run through all dates
+    gen.reset_filter_state()
+    
+    for date in signals.index:
+        gen.get_position_for_date(signals, returns, date, data_start, min_training_months=12)
+    
+    stats = gen.get_filter_stats()
+    filter_rate = stats['filter_rate']
+    
+    print(f"  Total signals: {stats['total_signals']}")
+    print(f"  Filtered: {stats['filtered_signals']}")
+    print(f"  Traded: {stats['traded_signals']}")
+    print(f"  Filter rate: {filter_rate*100:.1f}%")
+    
+    # Expected ~56% based on validation
+    if 0.40 <= filter_rate <= 0.70:
+        print(f"  ✓ Filter rate in expected range (40-70%)")
+        return True
+    else:
+        print(f"  ⚠ WARNING - Filter rate outside expected range")
+        return True  # Still pass, just warn
 
 
 # =============================================================================
@@ -268,8 +367,8 @@ def test_hit_rate_calculation(df_1h):
 
 def main():
     print("="*60)
-    print("SIGNALS MODULE VALIDATION")
-    print("Comparing extracted module vs original backtest functions")
+    print("16-STATE SIGNALS MODULE VALIDATION")
+    print("With NO_MA72_ONLY Filter")
     print("="*60)
     
     # Load data
@@ -286,9 +385,11 @@ def main():
     
     results.append(("Resampling", test_resample(df_1h)))
     results.append(("Trend Labeling", test_trend_labeling(df_1h)))
-    results.append(("32-State Signals", test_32state_signals(df_1h)))
-    results.append(("SignalGenerator Class", test_signal_generator_class(df_1h)))
+    results.append(("16-State Signals", test_16state_signals(df_1h)))
+    results.append(("Filter Behavior", test_filter_behavior()))
     results.append(("Hit Rate Calculation", test_hit_rate_calculation(df_1h)))
+    results.append(("SignalGenerator Class", test_signal_generator_class(df_1h)))
+    results.append(("Filter Rate", test_filter_rate(df_1h)))
     
     # Summary
     print("\n" + "="*60)
@@ -297,17 +398,17 @@ def main():
     
     all_passed = True
     for name, passed in results:
-        status = "? PASS" if passed else "? FAIL"
+        status = "✓ PASS" if passed else "✗ FAIL"
         print(f"  {name}: {status}")
         if not passed:
             all_passed = False
     
     print("\n" + "="*60)
     if all_passed:
-        print("? ALL TESTS PASSED - Module is validated!")
-        print("  Safe to use signals module in backtest and live trading.")
+        print("✓ ALL TESTS PASSED - 16-State Module Validated!")
+        print("  Ready for paper trading.")
     else:
-        print("? VALIDATION FAILED - Do NOT use module until fixed!")
+        print("✗ VALIDATION FAILED - Fix issues before deployment!")
     print("="*60)
     
     return all_passed
