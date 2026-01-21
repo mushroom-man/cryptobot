@@ -31,6 +31,15 @@ DATABASE_URL = os.getenv(
 )
 
 
+def _to_python(val):
+    """Convert numpy types to native Python types for database compatibility."""
+    if val is None:
+        return None
+    if hasattr(val, 'item'):  # numpy scalars have .item() method
+        return val.item()
+    return val
+
+
 class Database:
     """Database interface for CryptoBot."""
     
@@ -99,7 +108,7 @@ class Database:
             df = pd.read_sql(text(query), conn, params=params)
         
         if len(df) > 0:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_localize(None)
             df = df.set_index('timestamp')
         
         return df
@@ -204,7 +213,7 @@ class Database:
             df = pd.read_sql(text(query), conn, params=params)
         
         if len(df) > 0:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_localize(None)
             df = df.set_index('timestamp')
         
         return df
@@ -246,10 +255,10 @@ class Database:
                 "pair": pair,
                 "strategy": strategy,
                 "direction": direction,
-                "size": size,
-                "price": price,
-                "slippage_bps": slippage_bps,
-                "transaction_cost": transaction_cost,
+                "size": _to_python(size),
+                "price": _to_python(price),
+                "slippage_bps": _to_python(slippage_bps),
+                "transaction_cost": _to_python(transaction_cost),
                 "execution_type": execution_type,
                 "order_id": order_id,
                 "notes": notes
@@ -342,10 +351,10 @@ class Database:
                 "pair": pair,
                 "strategy": strategy,
                 "signal": signal,
-                "target_position": target_position,
-                "confidence": confidence,
-                "regime": regime,
-                "prediction": prediction
+                "target_position": _to_python(target_position),
+                "confidence": _to_python(confidence),
+                "regime": _to_python(regime),
+                "prediction": _to_python(prediction)
             })
             conn.commit()
             return True
@@ -394,10 +403,49 @@ class Database:
             df = pd.read_sql(text(query), conn, params=params)
         
         if len(df) > 0:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_localize(None)
             df = df.set_index('timestamp')
         
         return df
+    
+    def get_latest_signal(self, pair: str, strategy: str = None) -> Optional[dict]:
+        """
+        Get the most recent signal for a specific pair.
+        
+        Args:
+            pair: Trading pair
+            strategy: Strategy name filter (optional)
+        
+        Returns:
+            Dict with signal details or None if no signal found
+        """
+        query = """
+            SELECT * FROM signals 
+            WHERE pair = :pair
+        """
+        params = {"pair": pair}
+        
+        if strategy:
+            query += " AND strategy = :strategy"
+            params["strategy"] = strategy
+        
+        query += " ORDER BY timestamp DESC LIMIT 1"
+        
+        with self.engine.connect() as conn:
+            result = conn.execute(text(query), params)
+            row = result.fetchone()
+            if row:
+                return {
+                    "timestamp": row[0],
+                    "pair": row[1],
+                    "strategy": row[2],
+                    "signal": row[3],
+                    "target_position": row[4],
+                    "confidence": row[5],
+                    "regime": row[6],
+                    "prediction": row[7]
+                }
+            return None
     
     # =========================================================================
     # Backtest Results
@@ -437,13 +485,13 @@ class Database:
                 "pair": pair,
                 "test_start": test_start,
                 "test_end": test_end,
-                "total_return": total_return,
-                "annual_return": annual_return,
-                "sharpe_ratio": sharpe_ratio,
-                "sortino_ratio": sortino_ratio,
-                "max_drawdown": max_drawdown,
-                "num_trades": num_trades,
-                "win_rate": win_rate,
+                "total_return": _to_python(total_return),
+                "annual_return": _to_python(annual_return),
+                "sharpe_ratio": _to_python(sharpe_ratio),
+                "sortino_ratio": _to_python(sortino_ratio),
+                "max_drawdown": _to_python(max_drawdown),
+                "num_trades": _to_python(num_trades),
+                "win_rate": _to_python(win_rate),
                 "config": json.dumps(config) if config else None,
                 "notes": notes
             })
@@ -518,10 +566,10 @@ class Database:
             conn.execute(text(query), {
                 "timestamp": timestamp,
                 "pair": pair,
-                "position": position,
-                "entry_price": entry_price,
-                "current_price": current_price,
-                "unrealized_pnl": unrealized_pnl
+                "position": _to_python(position),
+                "entry_price": _to_python(entry_price),
+                "current_price": _to_python(current_price),
+                "unrealized_pnl": _to_python(unrealized_pnl)
             })
             conn.commit()
             return True
@@ -617,12 +665,12 @@ class Database:
         with self.engine.connect() as conn:
             conn.execute(text(query), {
                 "timestamp": timestamp,
-                "total_equity": total_equity,
-                "cash": cash,
-                "invested": invested,
-                "daily_pnl": daily_pnl,
-                "drawdown": drawdown,
-                "peak_equity": peak_equity
+                "total_equity": _to_python(total_equity),
+                "cash": _to_python(cash),
+                "invested": _to_python(invested),
+                "daily_pnl": _to_python(daily_pnl),
+                "drawdown": _to_python(drawdown),
+                "peak_equity": _to_python(peak_equity)
             })
             conn.commit()
             return True
@@ -682,7 +730,7 @@ class Database:
             df = pd.read_sql(text(query), conn, params=params)
         
         if len(df) > 0:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_localize(None)
             df = df.set_index('timestamp')
         
         return df

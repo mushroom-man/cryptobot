@@ -2,12 +2,12 @@
 # =====================================
 
 # Trading pairs to monitor
+
 pairs:
-  - XBTUSD
-  - ETHUSD
   - XLMUSD
   - ZECUSD
   - ETCUSD
+  - ETHUSD
   - XMRUSD
   - ADAUSD
 
@@ -32,6 +32,7 @@ risk:
 execution:
   mode: "paper"               # paper or live
   trading_cost_bps: 20        # 20 bps = 0.20%
+  slippage_bps: 5         
 
 # Data settings
 data:
@@ -44,19 +45,22 @@ logging:
 
 # Notifications
 notifications:
-  enabled: false
+  enabled: true
   
   # Pushover (mobile push notifications)
   pushover:
-    - user_key: "your_pushover_user_key"
-      api_token: "your_pushover_api_token"
+    - user_key: ""
+      api_token: ""
   
   # Email
   email:
     smtp_server: "smtp.gmail.com"
     smtp_port: 587
-    sender: "your_email@gmail.com"
-    password: "your_gmail_app_password"
+    sender: "johnhward2@gmail.com"
+    password: "gtxlupvfmfpfdmfw"
     recipients:
-      - "recipient1@gmail.com"
-      - "recipient2@gmail.com"
+      - "methebim@gmail.com"
+      - "phillipeglezos@hotmail.com"
+      - "johnhward2@bigpond.com"
+
+

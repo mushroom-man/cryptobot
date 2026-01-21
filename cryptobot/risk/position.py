@@ -12,7 +12,7 @@ From strategy document:
     - Fractional Kelly (0.25-0.5) for smoother equity curve
 
 Usage:
-    from cryptobot.shared.sizing import KellySizer
+    from cryptobot.risk.position import KellySizer
     
     sizer = KellySizer(
         kelly_fraction=0.25,
@@ -30,8 +30,6 @@ Usage:
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any
 import numpy as np
-
-from cryptobot.shared.core.portfolio import Portfolio
 
 
 @dataclass
@@ -113,8 +111,6 @@ class KellySizer:
         
         Final position:
             position = kelly * kelly_fraction * regime_mult * ma_mult * vol_scale
-    
-    Implements PositionSizer protocol from shared.core.engine.
     """
     
     def __init__(self, config: Optional[SizingConfig] = None):
@@ -130,19 +126,17 @@ class KellySizer:
         self,
         prediction: float,
         features: Dict[str, float],
-        portfolio: Portfolio,
-        pair: str,
+        portfolio: Any = None,
+        pair: str = None,
     ) -> float:
         """
         Calculate target position size.
         
-        Implements PositionSizer protocol.
-        
         Args:
             prediction: Model prediction (probability of price increase)
             features: Current features dict
-            portfolio: Current portfolio state
-            pair: Trading pair
+            portfolio: Current portfolio state (optional, for interface compatibility)
+            pair: Trading pair (optional, for interface compatibility)
         
         Returns:
             Target position as fraction of equity (signed: + long, - short)
@@ -352,8 +346,8 @@ class FixedSizer:
         self,
         prediction: float,
         features: Dict[str, float],
-        portfolio: Portfolio,
-        pair: str,
+        portfolio: Any = None,
+        pair: str = None,
     ) -> float:
         if prediction > self.p_threshold:
             return self.position_size
@@ -381,8 +375,8 @@ class VolatilityTargetSizer:
         self,
         prediction: float,
         features: Dict[str, float],
-        portfolio: Portfolio,
-        pair: str,
+        portfolio: Any = None,
+        pair: str = None,
     ) -> float:
         # Get current volatility
         vol = features.get('rolling_vol_168h', features.get('garch_vol_simple', 0.5))

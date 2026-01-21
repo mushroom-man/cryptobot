@@ -287,7 +287,8 @@ class KrakenAPI:
                 last_ts = result.scalar()
                 
                 if last_ts:
-                    last_ts = pd.to_datetime(last_ts).tz_localize(None)
+                    # Convert to UTC before stripping timezone (database may return Melbourne time)
+                    last_ts = pd.to_datetime(last_ts, utc=True).tz_localize(None)
                     df_to_insert = df_to_insert[df_to_insert['timestamp'] > last_ts]
         
         if len(df_to_insert) == 0:

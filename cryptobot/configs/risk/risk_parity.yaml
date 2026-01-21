@@ -1,0 +1,106 @@
+# CryptoBot Risk Parity Sizing Configuration
+# =============================================
+# SINGLE SOURCE OF TRUTH for position sizing parameters.
+#
+# These values are from the validated backtest (16state_combined_backtest.py)
+# which achieved:
+#   - Annual Return: +113.9%
+#   - Sharpe Ratio: 2.84
+#   - Max Drawdown: 16.8%
+#   - Calmar Ratio: 6.77
+#
+# DO NOT MODIFY without re-running backtest validation.
+
+# =============================================================================
+# TRADING PAIRS (Validated Set)
+# =============================================================================
+# These pairs were selected through backtesting and have sufficient liquidity
+# and data history for the 16-state strategy.
+
+pairs:
+  - XLMUSD
+  - ZECUSD
+  - ETCUSD
+  - ETHUSD
+  - XMRUSD
+  - ADAUSD
+
+# =============================================================================
+# EXPOSURE LIMITS
+# =============================================================================
+# Control overall portfolio leverage and risk.
+
+max_exposure: 2.0              # Maximum total exposure (2.0 = 200% of equity)
+                               # Higher = more aggressive, more risk
+
+min_exposure_floor: 0.40       # Minimum exposure even in worst drawdown
+                               # Prevents going completely flat
+
+# =============================================================================
+# VOLATILITY TARGETING
+# =============================================================================
+# Scale position sizes to target consistent portfolio volatility.
+
+target_vol: 0.40               # Target annualized portfolio volatility (40%)
+                               # Higher = accept more volatility for more return
+
+vol_lookback_months: 1         # Months of history for realized vol calculation
+                               # 1 month = responsive, 3 months = smoother
+
+# =============================================================================
+# WEIGHT CALCULATION
+# =============================================================================
+# Parameters for calculating inverse-volatility weights.
+
+cov_lookback_months: 2         # Months of history for weight calculation
+                               # Longer = more stable weights, less responsive
+
+min_weight_samples: 20         # Minimum daily samples needed for weight calc
+                               # Below this, use equal weights as fallback
+
+# =============================================================================
+# DRAWDOWN PROTECTION
+# =============================================================================
+# Reduce exposure as drawdown increases to limit losses.
+
+dd_start_reduce: -0.20         # Start reducing exposure at -20% drawdown
+                               # Above this, full exposure allowed
+
+dd_full_reduce: -0.50          # Maximum reduction at -50% drawdown
+                               # At this level, exposure = min_exposure_floor
+
+# =============================================================================
+# TRADING PARAMETERS
+# =============================================================================
+# Execution and cost parameters.
+
+trading_cost: 0.0020           # Round-trip trading cost (20 bps = 0.20%)
+                               # Includes spread, slippage, and fees
+
+min_trade_size: 100.0          # Minimum trade size in USD
+                               # Avoid tiny trades that cost more than benefit
+
+# =============================================================================
+# SIGNAL PARAMETERS (for reference, used by SignalGenerator)
+# =============================================================================
+# These are not used by RiskParitySizer directly but documented here
+# as part of the validated configuration.
+
+# MA Periods (in bars at respective timeframes)
+# ma_period_24h: 16
+# ma_period_72h: 6  
+# ma_period_168h: 2
+
+# Entry/Exit Buffers (for hysteresis)
+# entry_buffer: 0.015          # 1.5% above/below MA to enter trend
+# exit_buffer: 0.005           # 0.5% buffer to exit trend
+
+# Hit Rate Thresholds
+# strong_buy_threshold: 0.55
+# buy_threshold: 0.50
+# sell_threshold: 0.45
+
+# Training Requirements
+# min_training_months: 12      # Minimum months before live trading
+# hit_rate_threshold: 0.50     # Minimum hit rate to take position
+# min_samples_per_state: 20    # Minimum samples per state for confidence

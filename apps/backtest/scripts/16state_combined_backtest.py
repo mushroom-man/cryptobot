@@ -20,8 +20,11 @@ Usage:
     python 16state_combined_backtest_v6.py
 """
 
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 import sys
-sys.path.insert(0, 'D:/cryptobot_docker/cryptobot/data')
+sys.path.insert(0, str(PROJECT_ROOT))
+from cryptobot.data.database import Database
 
 import pandas as pd
 import numpy as np
@@ -31,8 +34,6 @@ from itertools import combinations, product
 from concurrent.futures import ProcessPoolExecutor
 import warnings
 warnings.filterwarnings('ignore')
-
-from database import Database
 
 
 # =============================================================================

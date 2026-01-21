@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 CryptoBot - 16-State Signal Generator
 ======================================
@@ -392,7 +392,8 @@ def get_16state_position(
     trend_perm: Tuple[int, int],
     ma_perm: Tuple[int, int],
     hit_rates: Dict,
-    threshold: float = HIT_RATE_THRESHOLD
+    threshold: float = HIT_RATE_THRESHOLD,
+    conservative_skip: bool = True,
 ) -> float:
     """
     Get position signal for a 16-state.
@@ -402,17 +403,25 @@ def get_16state_position(
         ma_perm: (ma72_above_ma24, ma168_above_ma24)
         hit_rates: Dict from calculate_expanding_hit_rates()
         threshold: Hit rate threshold for INVEST signal
+        conservative_skip: If True, don't go long on bearish signals
+                          when samples are insufficient (default: True)
     
     Returns:
         1.00: INVEST (hit rate > threshold and sufficient samples)
-        0.50: SKIP (insufficient samples)
-        0.00: AVOID (hit rate <= threshold)
+        0.50: SKIP (insufficient samples, but bullish or not conservative)
+        0.00: AVOID (hit rate <= threshold, or insufficient + bearish + conservative)
     """
     key = (trend_perm, ma_perm)
     data = hit_rates.get(key, {'sufficient': False, 'hit_rate': 0.5})
     
     if not data['sufficient']:
-        return 0.50  # SKIP
+        # Insufficient samples - be conservative
+        if conservative_skip and data['hit_rate'] < threshold:
+            # Don't go long on bearish signals even with insufficient data
+            return 0.00  # AVOID
+        else:
+            # Bullish or neutral - take half position as hedge
+            return 0.50  # SKIP
     elif data['hit_rate'] > threshold:
         return 1.00  # INVEST
     else:
