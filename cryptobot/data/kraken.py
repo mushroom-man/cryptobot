@@ -146,7 +146,7 @@ class KrakenAPI:
         ])
         
         # Convert types
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
         for col in ['open', 'high', 'low', 'close', 'vwap', 'volume']:
             df[col] = df[col].astype(float)
         df['count'] = df['count'].astype(int)
@@ -229,87 +229,79 @@ class KrakenAPI:
         return combined
     
     def fetch_and_store(
-        self,
-        pair: str,
-        interval: int = 60,
-        since_date: str = None,
-        if_exists: str = "append"
-    ) -> int:
-        """
-        Fetch OHLC data from Kraken and store in database.
-        
-        Args:
-            pair: Trading pair (e.g., "XBTUSD")
-            interval: Interval in minutes (60 for hourly)
-            since_date: Start date. If None, fetches from last database entry.
-            if_exists: "append" or "replace"
-        
-        Returns:
-            Number of rows inserted
-        """
-        # Determine start date
-        if since_date is None:
-            # Get last timestamp from database
-            with self.engine.connect() as conn:
-                result = conn.execute(
-                    text("SELECT MAX(timestamp) FROM ohlcv WHERE pair = :pair"),
-                    {"pair": pair}
-                )
-                last_ts = result.scalar()
+            self,
+            pair: str,
+            interval: int = 60,
+            since_date: str = None,
+            if_exists: str = "append"
+        ) -> int:
+            """
+            Fetch OHLC data from Kraken and store in database.
+            Uses upsert (ON CONFLICT DO NOTHING) for idempotent inserts.
+            """
+            # Determine start date
+            if since_date is None:
+                with self.engine.connect() as conn:
+                    result = conn.execute(
+                        text("SELECT MAX(timestamp) FROM ohlcv WHERE pair = :pair"),
+                        {"pair": pair}
+                    )
+                    last_ts = result.scalar()
+                    
+                    if last_ts:
+                        since_date = (last_ts - timedelta(hours=24)).strftime("%Y-%m-%d")
+                        print(f"Continuing from last database entry: {last_ts}")
+                    else:
+                        print("No existing data found. Please specify since_date.")
+                        return 0
+            
+            # Fetch data
+            df = self.get_ohlc_since_date(pair, since_date, interval)
+            
+            if len(df) == 0:
+                print("No new data to insert")
+                return 0
+            
+            # Prepare for database
+            df_to_insert = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].copy()
+            df_to_insert['pair'] = pair
+            df_to_insert['source'] = 'kraken_api'
+            df_to_insert['volume_quote'] = None
+            
+            print(f"Inserting {len(df_to_insert)} rows...")
+            
+            inserted = 0
+            
+            # Use raw psycopg2 connection for execute_values
+            from psycopg2.extras import execute_values
+            
+            raw_conn = self.engine.raw_connection()
+            try:
+                cursor = raw_conn.cursor()
                 
-                if last_ts:
-                    since_date = (last_ts + timedelta(hours=1)).strftime("%Y-%m-%d")
-                    print(f"Continuing from last database entry: {last_ts}")
-                else:
-                    print("No existing data found. Please specify since_date.")
-                    return 0
-        
-        # Fetch data
-        df = self.get_ohlc_since_date(pair, since_date, interval)
-        
-        if len(df) == 0:
-            print("No new data to insert")
-            return 0
-        
-        # Prepare for database
-        df_to_insert = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].copy()
-        df_to_insert['pair'] = pair
-        df_to_insert['source'] = 'kraken_api'
-        df_to_insert['volume_quote'] = None
-        
-        # Handle existing data
-        if if_exists == "append":
-            with self.engine.connect() as conn:
-                result = conn.execute(
-                    text("SELECT MAX(timestamp) FROM ohlcv WHERE pair = :pair"),
-                    {"pair": pair}
-                )
-                last_ts = result.scalar()
+                # Prepare data as list of tuples
+                values = [
+                    (row['timestamp'], row['open'], row['high'], row['low'], 
+                     row['close'], row['volume'], row['pair'], row['source'], row['volume_quote'])
+                    for _, row in df_to_insert.iterrows()
+                ]
                 
-                if last_ts:
-                    # Convert to UTC before stripping timezone (database may return Melbourne time)
-                    last_ts = pd.to_datetime(last_ts, utc=True).tz_localize(None)
-                    df_to_insert = df_to_insert[df_to_insert['timestamp'] > last_ts]
-        
-        if len(df_to_insert) == 0:
-            print("No new data to insert after filtering")
-            return 0
-        
-        # Insert
-        print(f"Inserting {len(df_to_insert)} rows...")
-        
-        df_to_insert.to_sql(
-            'ohlcv',
-            self.engine,
-            if_exists='append',
-            index=False,
-            method='multi',
-            chunksize=1000
-        )
-        
-        print(f"Done! Inserted {len(df_to_insert)} rows for {pair}")
-        
-        return len(df_to_insert)
+                sql = """
+                    INSERT INTO ohlcv (timestamp, open, high, low, close, volume, pair, source, volume_quote)
+                    VALUES %s
+                    ON CONFLICT (timestamp, pair) DO NOTHING
+                """
+                
+                execute_values(cursor, sql, values, page_size=500)
+                inserted = cursor.rowcount
+                raw_conn.commit()
+                
+            finally:
+                raw_conn.close()
+            
+            print(f"Done! Inserted {inserted} new rows for {pair}")
+            
+            return inserted
     
     def backfill_multiple_pairs(
         self,

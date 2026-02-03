@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 import uuid
 
-from cryptobot.shared.core.order import Order, OrderStatus
+from cryptobot.types.order import Order, OrderStatus
 
 
 @dataclass

@@ -16,10 +16,10 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any, Protocol
 from enum import Enum
 
-from cryptobot.shared.core.bar import Bar
-from cryptobot.shared.core.order import Order
-from cryptobot.shared.core.fill import Fill
-from cryptobot.shared.core.portfolio import Portfolio
+from cryptobot.types.bar import Bar
+from cryptobot.types.order import Order
+from cryptobot.types.fill import Fill
+from cryptobot.types.portfolio import Portfolio
 
 
 # =============================================================================

@@ -233,7 +233,8 @@ class Database:
         transaction_cost: float = 0,
         execution_type: str = "backtest",
         order_id: str = None,
-        notes: str = None
+        notes: str = None,
+        trade_type: str = None 
     ) -> int:
         """
         Record a trade in the database.
@@ -244,10 +245,10 @@ class Database:
         query = """
             INSERT INTO trades 
             (timestamp, pair, strategy, direction, size, price, slippage_bps, 
-             transaction_cost, execution_type, order_id, notes)
+             transaction_cost, execution_type, order_id, notes, trade_type)
             VALUES 
             (NOW(), :pair, :strategy, :direction, :size, :price, :slippage_bps,
-             :transaction_cost, :execution_type, :order_id, :notes)
+             :transaction_cost, :execution_type, :order_id, :notes, :trade_type)
             RETURNING id
         """
         with self.engine.connect() as conn:
@@ -261,7 +262,8 @@ class Database:
                 "transaction_cost": _to_python(transaction_cost),
                 "execution_type": execution_type,
                 "order_id": order_id,
-                "notes": notes
+                "notes": notes,
+                "trade_type": trade_type
             })
             conn.commit()
             return result.fetchone()[0]
@@ -447,6 +449,158 @@ class Database:
                 }
             return None
     
+    # =============================================================================
+    # Weights
+    # =============================================================================
+    # Add this section to database.py after the Signals section (around line 450)
+    # and before the Portfolio section.
+
+    def record_weight(
+        self,
+        pair: str,
+        weight: float,
+        strategy: str = '16state',
+        timestamp: datetime = None
+    ) -> bool:
+        """
+        Record a risk parity weight for a pair.
+        
+        Args:
+            pair: Trading pair (e.g., "XMRUSD")
+            weight: Risk parity weight (0.0 to 1.0)
+            strategy: Strategy name (default: '16state')
+            timestamp: Weight calculation timestamp (defaults to NOW())
+        
+        Returns:
+            True if successful
+        """
+        query = """
+            INSERT INTO weights 
+            (timestamp, pair, weight, strategy)
+            VALUES 
+            (COALESCE(:timestamp, NOW()), :pair, :weight, :strategy)
+            ON CONFLICT (timestamp, pair) 
+            DO UPDATE SET
+                weight = EXCLUDED.weight,
+                strategy = EXCLUDED.strategy
+        """
+        with self.engine.connect() as conn:
+            conn.execute(text(query), {
+                "timestamp": timestamp,
+                "pair": pair,
+                "weight": _to_python(weight),
+                "strategy": strategy
+            })
+            conn.commit()
+            return True
+
+    def record_weights(
+        self,
+        weights: dict,
+        strategy: str = '16state',
+        timestamp: datetime = None
+    ) -> int:
+        """
+        Record multiple risk parity weights at once.
+        
+        Args:
+            weights: Dict of {pair: weight} (e.g., {"XMRUSD": 0.15, "ETHUSD": 0.25})
+            strategy: Strategy name (default: '16state')
+            timestamp: Weight calculation timestamp (defaults to NOW())
+        
+        Returns:
+            Number of weights recorded
+        """
+        count = 0
+        for pair, weight in weights.items():
+            if self.record_weight(pair, weight, strategy, timestamp):
+                count += 1
+        return count
+
+    def get_weights(
+        self,
+        pair: str = None,
+        strategy: str = None,
+        start: str = None,
+        end: str = None
+    ) -> pd.DataFrame:
+        """
+        Get weight history from the database.
+        
+        Args:
+            pair: Filter by trading pair (optional)
+            strategy: Filter by strategy name (optional)
+            start: Start date filter (optional)
+            end: End date filter (optional)
+        
+        Returns:
+            DataFrame with weight history
+        """
+        query = "SELECT * FROM weights WHERE 1=1"
+        params = {}
+        
+        if pair:
+            query += " AND pair = :pair"
+            params["pair"] = pair
+        
+        if strategy:
+            query += " AND strategy = :strategy"
+            params["strategy"] = strategy
+        
+        if start:
+            query += " AND timestamp >= :start"
+            params["start"] = start
+        
+        if end:
+            query += " AND timestamp <= :end"
+            params["end"] = end
+        
+        query += " ORDER BY timestamp DESC"
+        
+        with self.engine.connect() as conn:
+            df = pd.read_sql(text(query), conn, params=params)
+        
+        if len(df) > 0:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_localize(None)
+        
+        return df
+
+    def get_current_weights(self) -> pd.DataFrame:
+        """
+        Get the most recent weight for each pair.
+        
+        Uses the current_weights view.
+        
+        Returns:
+            DataFrame with current weights per pair
+        """
+        query = "SELECT * FROM current_weights"
+        with self.engine.connect() as conn:
+            df = pd.read_sql(text(query), conn)
+        return df
+
+    def get_weights_at(self, timestamp: datetime) -> dict:
+        """
+        Get weights that were active at a specific timestamp.
+        
+        Finds the most recent weights recorded before or at the given time.
+        
+        Args:
+            timestamp: Point in time to query
+        
+        Returns:
+            Dict of {pair: weight}
+        """
+        query = """
+            SELECT DISTINCT ON (pair) pair, weight
+            FROM weights
+            WHERE timestamp <= :timestamp
+            ORDER BY pair, timestamp DESC
+        """
+        with self.engine.connect() as conn:
+            result = conn.execute(text(query), {"timestamp": timestamp})
+            return {row[0]: row[1] for row in result.fetchall()}
+        
     # =========================================================================
     # Backtest Results
     # =========================================================================
@@ -735,6 +889,102 @@ class Database:
         
         return df
     
+    
+    # =========================================================================
+    # Strategy State
+    # =========================================================================
+    
+    def get_strategy_state(self, pair: str, strategy: str = 'momentum') -> Optional[dict]:
+        """
+        Get persisted strategy state for a pair.
+        
+        Args:
+            pair: Trading pair
+            strategy: Strategy name (default: 'momentum')
+        
+        Returns:
+            Dict with state fields, or None if not found
+        """
+        query = """
+            SELECT pair, strategy, confirmed_state, duration_hours,
+                   pending_state, pending_hours, trend_24h, trend_168h, updated_at
+            FROM strategy_state
+            WHERE pair = :pair AND strategy = :strategy
+        """
+        with self.engine.connect() as conn:
+            result = conn.execute(text(query), {"pair": pair, "strategy": strategy})
+            row = result.fetchone()
+            if row:
+                return {
+                    'pair': row[0],
+                    'strategy': row[1],
+                    'confirmed_state': row[2],
+                    'duration_hours': row[3],
+                    'pending_state': row[4],
+                    'pending_hours': row[5],
+                    'trend_24h': row[6],
+                    'trend_168h': row[7],
+                    'updated_at': row[8],
+                }
+        return None
+    
+    def save_strategy_state(
+        self,
+        pair: str,
+        confirmed_state: int,
+        duration_hours: int,
+        pending_state: Optional[int],
+        pending_hours: int,
+        trend_24h: int,
+        trend_168h: int,
+        strategy: str = 'momentum'
+    ) -> bool:
+        """
+        Save strategy state for a pair (upsert).
+        
+        Args:
+            pair: Trading pair
+            confirmed_state: Current confirmed state (0-15)
+            duration_hours: Hours in current state
+            pending_state: State awaiting confirmation (or None)
+            pending_hours: Hours pending state has persisted
+            trend_24h: Hysteresis trend state for 24h MA
+            trend_168h: Hysteresis trend state for 168h MA
+            strategy: Strategy name (default: 'momentum')
+        
+        Returns:
+            True if successful
+        """
+        query = """
+            INSERT INTO strategy_state 
+                (pair, strategy, confirmed_state, duration_hours, 
+                 pending_state, pending_hours, trend_24h, trend_168h, updated_at)
+            VALUES 
+                (:pair, :strategy, :confirmed_state, :duration_hours,
+                 :pending_state, :pending_hours, :trend_24h, :trend_168h, NOW())
+            ON CONFLICT (pair) DO UPDATE SET
+                strategy = EXCLUDED.strategy,
+                confirmed_state = EXCLUDED.confirmed_state,
+                duration_hours = EXCLUDED.duration_hours,
+                pending_state = EXCLUDED.pending_state,
+                pending_hours = EXCLUDED.pending_hours,
+                trend_24h = EXCLUDED.trend_24h,
+                trend_168h = EXCLUDED.trend_168h,
+                updated_at = NOW()
+        """
+        with self.engine.connect() as conn:
+            conn.execute(text(query), {
+                "pair": pair,
+                "strategy": strategy,
+                "confirmed_state": _to_python(confirmed_state),
+                "duration_hours": _to_python(duration_hours),
+                "pending_state": _to_python(pending_state),
+                "pending_hours": _to_python(pending_hours),
+                "trend_24h": _to_python(trend_24h),
+                "trend_168h": _to_python(trend_168h),
+            })
+            conn.commit()
+            return True
     
     # =========================================================================
     # Utility

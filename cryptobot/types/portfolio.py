@@ -11,9 +11,9 @@ from typing import Dict, List, Optional, Any
 import pandas as pd
 import numpy as np
 
-from cryptobot.shared.core.bar import Bar
-from cryptobot.shared.core.order import Order, OrderSide
-from cryptobot.shared.core.fill import Fill
+from cryptobot.types.bar import Bar
+from cryptobot.types.order import Order, OrderSide
+from cryptobot.types.fill import Fill
 
 
 @dataclass

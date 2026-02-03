@@ -3,38 +3,49 @@
 """
 CryptoBot - Live/Paper Trading Runner
 ======================================
-FILE: apps/live/runner.py
+FILE: apps/live/trader.py
 
-Hourly runner for the 16-state strategy using Risk Parity position sizing.
+Trading runner using pluggable Strategy + Executor pattern.
 
-This runner uses the SAME RiskParitySizer as the validated backtest
-to ensure live trading matches backtest performance.
+Strategies:
+    - momentum: Validated 16-state momentum (2.5% buffer, 3h confirm, S12/14 exclusion)
 
-Validated Performance (16state_combined_backtest.py):
-    - Annual Return: +113.9%
-    - Sharpe Ratio: 2.84
-    - Max Drawdown: 16.8%
-    - Calmar Ratio: 6.77
+Execution Modes:
+    - paper: Simulated execution with slippage
+    - live: Real execution via Kraken API
+
+Validated Performance (momentum strategy):
+    - Annual Return: +58.6%
+    - Sharpe Ratio: 3.04
+    - Max Drawdown: -12.2%
 
 Usage:
-    python -m apps.live.runner              # Run trading once (manual)
-    python -m apps.live.runner --dry-run    # Show what would happen
-    python -m apps.live.runner --hourly     # Hourly mode: update data, trade at 00:xx Melbourne
+    python -m apps.live.trader --strategy momentum --mode paper
+    python -m apps.live.trader --strategy momentum --mode live
+    python -m apps.live.trader --strategy momentum --mode paper --hourly
+    python -m apps.live.trader --dry-run
 
-Designed to run hourly via systemd timer with --hourly flag.
+Scheduling:
+    --hourly flag: Update data first, then run trading logic.
+    
+    The 3h confirmation filter is inside MomentumStrategy. To catch signals
+    when they confirm, trading logic MUST run every hour. The strategy
+    internally tracks state persistence and only triggers trades when
+    confirmation completes.
+    
+    Cron example (run every hour):
+        0 * * * * cd ~/cryptobot && python -m apps.live.trader --strategy momentum --mode paper --hourly
+
+    Daily reports are sent at midnight Melbourne time.
 """
 
 import sys
 import os
 import argparse
 import logging
-import smtplib
-import requests
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 import yaml
 
 # Add project root to path
@@ -46,8 +57,15 @@ import numpy as np
 
 from cryptobot.data.database import Database
 from cryptobot.data.kraken import KrakenAPI
-from cryptobot.signals.generator import SignalGenerator
 from cryptobot.risk.risk_parity import RiskParitySizer, RiskParityConfig
+from cryptobot.risk.var import calculate_var
+from cryptobot.reports import DailyReport, ReportSender
+
+# Strategy and Executor imports
+from cryptobot.strategies import MomentumStrategy
+from cryptobot.executors import PaperExecutor, LiveExecutor
+from cryptobot.types.bar import Bar
+from cryptobot.types.order import Order
 
 # Melbourne timezone for display
 try:
@@ -57,12 +75,13 @@ except ImportError:
     import pytz
     MELBOURNE_TZ = pytz.timezone('Australia/Melbourne')
 
+
 def to_melbourne(dt: datetime) -> datetime:
     """Convert datetime to Melbourne timezone for display."""
     if dt.tzinfo is None:
-        # Assume naive datetime is UTC
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(MELBOURNE_TZ)
+
 
 def melbourne_now() -> datetime:
     """Get current time in Melbourne timezone."""
@@ -90,10 +109,29 @@ def setup_logging(log_file: str = None, level: str = "INFO"):
         level=log_level,
         format=log_format,
         handlers=handlers,
-        force=True  # Override any existing config
+        force=True
     )
     
-    return logging.getLogger('paper_trader')
+    return logging.getLogger('trader')
+
+
+# =============================================================================
+# TRADE CLASSIFICATION
+# =============================================================================
+
+def classify_trade(current_position: float, target_position: float) -> str:
+    """Classify trade as ENTRY/EXIT/INCREASE/DECREASE."""
+    had = abs(current_position) > 0.0001
+    has = abs(target_position) > 0.0001
+    
+    if not had and has:
+        return 'ENTRY'
+    elif had and not has:
+        return 'EXIT'
+    elif target_position > current_position:
+        return 'INCREASE'
+    else:
+        return 'DECREASE'
 
 
 # =============================================================================
@@ -152,417 +190,6 @@ def update_data(config: dict, logger: logging.Logger) -> int:
 
 
 # =============================================================================
-# VALUE AT RISK CALCULATION
-# =============================================================================
-
-def calculate_var(db: Database, pairs: List[str], confidence: float = 0.95, horizon_days: int = 1) -> Dict:
-    """
-    Calculate Value at Risk for current portfolio.
-    
-    Args:
-        db: Database instance
-        pairs: List of trading pairs
-        confidence: Confidence level (0.95 = 95%)
-        horizon_days: Time horizon in days
-    
-    Returns:
-        Dict with VaR metrics
-    """
-    try:
-        positions_df = db.get_current_positions()
-        equity_data = db.get_latest_equity()
-        
-        if positions_df is None or len(positions_df) == 0:
-            return {'var_95': 0, 'var_99': 0, 'portfolio_vol': 0}
-        
-        # Calculate total invested from current positions (not equity table)
-        total_invested = 0.0
-        for _, row in positions_df.iterrows():
-            if row['position'] and row['current_price']:
-                total_invested += abs(row['position'] * row['current_price'])
-        
-        if total_invested <= 0:
-            return {'var_95': 0, 'var_99': 0, 'portfolio_vol': 0}
-        
-        # Get historical returns for VaR calculation
-        returns_data = {}
-        for pair in pairs:
-            df = db.get_ohlcv(pair, start=(datetime.now(timezone.utc) - timedelta(days=365)).isoformat())
-            if df is not None and len(df) > 0:
-                # Daily returns from hourly data
-                daily = df['close'].resample('24h').last().ffill().pct_change().dropna()
-                returns_data[pair] = daily
-        
-        if not returns_data:
-            return {'var_95': 0, 'var_99': 0, 'portfolio_vol': 0}
-        
-        # Combine into DataFrame
-        returns_df = pd.DataFrame(returns_data).dropna()
-        
-        if len(returns_df) < 30:
-            return {'var_95': 0, 'var_99': 0, 'portfolio_vol': 0}
-        
-        # Get position weights (using calculated total_invested)
-        weights = {}
-        
-        for _, row in positions_df.iterrows():
-            pair = row['pair']
-            if pair in returns_df.columns and row['position'] and row['current_price']:
-                position_value = abs(row['position'] * row['current_price'])
-                weights[pair] = position_value / total_invested
-        
-        if not weights:
-            return {'var_95': 0, 'var_99': 0, 'portfolio_vol': 0}
-        
-        # Portfolio returns
-        portfolio_returns = sum(
-            returns_df[pair] * weight 
-            for pair, weight in weights.items() 
-            if pair in returns_df.columns
-        )
-        
-        # VaR calculations
-        var_95 = np.percentile(portfolio_returns, (1 - 0.95) * 100) * np.sqrt(horizon_days)
-        var_99 = np.percentile(portfolio_returns, (1 - 0.99) * 100) * np.sqrt(horizon_days)
-        portfolio_vol = portfolio_returns.std() * np.sqrt(252)  # Annualized
-        
-        # Convert to dollar amounts
-        total_equity = equity_data['total_equity'] if equity_data else total_invested
-        
-        return {
-            'var_95': var_95 * total_equity,  # 95% VaR in dollars
-            'var_99': var_99 * total_equity,  # 99% VaR in dollars
-            'var_95_pct': var_95,             # 95% VaR as percentage
-            'var_99_pct': var_99,             # 99% VaR as percentage
-            'portfolio_vol': portfolio_vol,   # Annualized volatility
-        }
-    
-    except Exception as e:
-        logging.getLogger('paper_trader').error(f"VaR calculation failed: {e}")
-        return {'var_95': 0, 'var_99': 0, 'portfolio_vol': 0}
-
-
-# =============================================================================
-# DAILY REPORT
-# =============================================================================
-
-def generate_report(db: Database, config: dict, trading_summary: dict = None) -> str:
-    """
-    Generate comprehensive daily report.
-    
-    Args:
-        db: Database instance
-        config: Configuration dictionary
-        trading_summary: Summary from trading run (optional)
-    
-    Returns:
-        Formatted report string
-    """
-    # Get data
-    equity = db.get_latest_equity()
-    positions_df = db.get_current_positions()
-    
-    # Calculate VaR
-    var_metrics = calculate_var(db, config['pairs'])
-    
-    # Get today's trades
-    today = datetime.now(timezone.utc).date()
-    trades_df = db.get_trades(start=today.isoformat())
-    
-    # Calculate invested value from current positions
-    invested_value = 0.0
-    if positions_df is not None and len(positions_df) > 0:
-        for _, p in positions_df.iterrows():
-            if p['position'] and p['current_price']:
-                invested_value += abs(p['position'] * p['current_price'])
-    
-    # Calculate capital deployed today from trading summary
-    capital_deployed_today = 0.0
-    if trading_summary and trading_summary.get('total_trade_value'):
-        capital_deployed_today = trading_summary['total_trade_value']
-    
-    # Get Daily P&L from stored equity (calculated correctly in _update_equity)
-    daily_pnl_24h = equity.get('daily_pnl', 0) if equity else 0
-    
-    # Build report with Melbourne time
-    now_melb = melbourne_now()
-    lines = [
-        "=" * 50,
-        "📊 CRYPTOBOT DAILY REPORT",
-        f"📅 {now_melb.strftime('%Y-%m-%d')}",
-        f"⏰ {now_melb.strftime('%H:%M:%S')} Melbourne",
-        "=" * 50,
-        "",
-        "💰 EQUITY",
-        "-" * 30,
-    ]
-    
-    if equity:
-        cash_balance = equity['total_equity'] - invested_value
-        lines.extend([
-            f"  Total Equity Value:    ${equity['total_equity']:>12,.2f}",
-            f"  Cash Balance:          ${cash_balance:>12,.2f}",
-            f"  Invested Value:        ${invested_value:>12,.2f}",
-            f"  Capital Deployed Today:${capital_deployed_today:>12,.2f}",
-            f"  Daily P&L (24h):       ${daily_pnl_24h:>+12,.2f}",
-        ])
-    else:
-        lines.append("  No equity data available")
-    
-    lines.extend([
-        "",
-        "📉 RISK METRICS",
-        "-" * 30,
-    ])
-    
-    if equity:
-        drawdown_pct = equity['drawdown'] * 100 if equity['drawdown'] else 0
-        lines.extend([
-            f"  Current Drawdown:  {drawdown_pct:>10.2f}%",
-            f"  Max Allowed DD:    {config['risk']['max_drawdown']*100:>10.1f}%",
-            f"  VaR (95%, 1-day):  ${var_metrics.get('var_95', 0):>10,.2f}",
-            f"  VaR (99%, 1-day):  ${var_metrics.get('var_99', 0):>10,.2f}",
-            f"  Portfolio Vol:     {var_metrics.get('portfolio_vol', 0)*100:>10.1f}% ann.",
-        ])
-    
-    lines.extend([
-        "",
-        "📈 TODAY'S TRADES",
-        "-" * 30,
-    ])
-    
-    if trading_summary and trading_summary.get('trades'):
-        total_trading_cost = sum(t.get('trading_cost', t.get('cost', 0)) for t in trading_summary['trades'])
-        total_slippage = sum(t.get('slippage', 0) for t in trading_summary['trades'])
-        lines.append(f"  Trades Executed: {trading_summary['trades_executed']}")
-        lines.append(f"  Total Value:     ${trading_summary['total_trade_value']:,.2f}")
-        lines.append(f"  Trading Costs:   ${total_trading_cost:,.2f}")
-        lines.append(f"  Slippage:        ${total_slippage:,.2f}")
-        lines.append("")
-        for t in trading_summary['trades']:
-            lines.append(f"  • {t['pair']}: {t['direction']} {t['size']:.6f} @ ${t['price']:,.2f}")
-    elif trades_df is not None and len(trades_df) > 0:
-        lines.append(f"  Trades: {len(trades_df)}")
-        for _, t in trades_df.head(10).iterrows():
-            lines.append(f"  • {t['pair']}: {t['direction']} @ ${t['price']:,.2f}")
-    else:
-        lines.append("  No trades executed today")
-    
-    lines.extend([
-        "",
-        "📊 CURRENT POSITIONS",
-        "-" * 30,
-    ])
-    
-    if positions_df is not None and len(positions_df) > 0:
-        has_positions = False
-        for _, p in positions_df.iterrows():
-            if p['position'] and abs(p['position']) > 0.0001:
-                has_positions = True
-                value = p['position'] * p['current_price'] if p['current_price'] else 0
-                pnl = p['unrealized_pnl'] if p['unrealized_pnl'] else 0
-                lines.append(
-                    f"  {p['pair']:8s}: {p['position']:>12.4f} "
-                    f"(${value:>10,.2f}, P&L: ${pnl:>+8,.2f})"
-                )
-        if not has_positions:
-            lines.append("  No open positions")
-    else:
-        lines.append("  No open positions")
-    
-    lines.extend([
-        "",
-        "📋 SIGNALS",
-        "-" * 30,
-    ])
-    
-    if trading_summary and trading_summary.get('signals'):
-        for sig in trading_summary['signals']:
-            # Tick for BUY signals, stop sign for SELL signals
-            if sig['signal'] in ['STRONG_BUY', 'BUY']:
-                status = "✅"
-            elif sig['signal'] in ['SELL', 'STRONG_SELL']:
-                status = "⛔"
-            else:
-                status = "⏸️"
-            
-            # Show target position info
-            target = sig.get('target_position', 0)
-            lines.append(
-                f"  {status} {sig['pair']:8s}: {sig['signal']:12s} "
-                f"(HR: {sig['hit_rate']:.1%}, Target: {target:.2f})"
-            )
-    else:
-        lines.append("  No signal data")
-    
-    # Risk Parity weights if available
-    if trading_summary and trading_summary.get('risk_parity_weights'):
-        lines.extend([
-            "",
-            "⚖️ RISK PARITY WEIGHTS",
-            "-" * 30,
-        ])
-        for pair, weight in trading_summary['risk_parity_weights'].items():
-            lines.append(f"  {pair:8s}: {weight:>6.1%}")
-    
-    lines.extend([
-        "",
-        "=" * 50,
-        "End of Report",
-        "=" * 50,
-    ])
-    
-    return "\n".join(lines)
-
-
-def send_report(db: Database, config: dict, trading_summary: dict = None, logger: logging.Logger = None) -> bool:
-    """
-    Generate and send daily report via Pushover and Email.
-    
-    Args:
-        db: Database instance
-        config: Configuration dictionary
-        trading_summary: Summary from trading run
-        logger: Logger instance
-    
-    Returns:
-        True if at least one notification sent successfully
-    """
-    if logger is None:
-        logger = logging.getLogger('paper_trader')
-    
-    report = generate_report(db, config, trading_summary)
-    success = False
-    
-    # Get notification settings
-    notifications = config.get('notifications', {})
-    if not notifications.get('enabled', False):
-        logger.info("Notifications disabled in config")
-        return False
-
-    # =========================================================================
-    # Send Pushover (supports multiple users)
-    # =========================================================================
-    pushover_config = notifications.get('pushover', {})
-    
-    # Handle multiple config formats:
-    # 1. List format: pushover: [{user_key: x, api_token: y}, ...]
-    # 2. Dict with users: pushover: {users: [{...}]}
-    # 3. Dict single user: pushover: {user_key: x, api_token: y}
-    
-    pushover_users = []
-    
-    if isinstance(pushover_config, list):
-        # Format 1: Direct list of users
-        pushover_users = pushover_config
-    elif isinstance(pushover_config, dict):
-        # Format 2 or 3
-        if 'users' in pushover_config:
-            pushover_users = pushover_config.get('users', [])
-        elif 'user_key' in pushover_config:
-            # Single user dict format
-            pushover_users = [pushover_config]
-    
-    # Also check environment variables if no users configured
-    if not pushover_users:
-        user_key = os.getenv('PUSHOVER_USER_KEY')
-        api_token = os.getenv('PUSHOVER_API_TOKEN')
-        if user_key and api_token:
-            pushover_users = [{'user_key': user_key, 'api_token': api_token}]
-    
-    # Get shared api_token if specified at top level (for dict format)
-    shared_api_token = None
-    if isinstance(pushover_config, dict):
-        shared_api_token = pushover_config.get('api_token')
-    
-    for i, user in enumerate(pushover_users):
-        user_key = user.get('user_key')
-        api_token = user.get('api_token') or shared_api_token or os.getenv('PUSHOVER_API_TOKEN')
-        
-        if not user_key or not api_token:
-            continue
-        
-        try:
-            # Build short message for push notification
-            equity = db.get_latest_equity()
-            short_msg = []
-            
-            if equity:
-                short_msg.append(f"💰 ${equity['total_equity']:,.0f}")
-                daily_pnl = equity['daily_pnl'] if equity['daily_pnl'] is not None else 0
-                short_msg.append(f"📈 P&L: ${daily_pnl:+,.0f}")
-                dd_pct = equity['drawdown'] * 100 if equity['drawdown'] else 0
-                short_msg.append(f"📉 DD: {dd_pct:.1f}%")
-            
-            if trading_summary:
-                short_msg.append(f"🔄 Trades: {trading_summary['trades_executed']}")
-            
-            response = requests.post(
-                "https://api.pushover.net/1/messages.json",
-                data={
-                    "token": api_token,
-                    "user": user_key,
-                    "title": "CryptoBot Daily Report",
-                    "message": "\n".join(short_msg),
-                },
-                timeout=10
-            )
-            if response.status_code == 200:
-                logger.info(f"✅ Pushover #{i+1} sent")
-                success = True
-            else:
-                logger.error(f"❌ Pushover #{i+1} failed: {response.status_code}")
-        except Exception as e:
-            logger.error(f"❌ Pushover #{i+1} error: {e}")
-    
-    # =========================================================================
-    # Send Email (supports multiple recipients)
-    # =========================================================================
-    email_config = notifications.get('email', {})
-    
-    # Handle old flat format for backward compatibility
-    if not email_config:
-        email_config = {
-            'sender': notifications.get('email_sender'),
-            'password': notifications.get('email_password'),
-            'recipients': [notifications.get('email_recipient')] if notifications.get('email_recipient') else [],
-            'smtp_server': 'smtp.gmail.com',
-            'smtp_port': 587
-        }
-    
-    sender = email_config.get('sender') or os.getenv('EMAIL_SENDER')
-    password = email_config.get('password') or os.getenv('EMAIL_PASSWORD')
-    recipients = email_config.get('recipients', [])
-    smtp_server = email_config.get('smtp_server', 'smtp.gmail.com')
-    smtp_port = email_config.get('smtp_port', 587)
-    
-    # Also check env for additional recipients
-    env_recipient = os.getenv('EMAIL_RECIPIENT')
-    if env_recipient and env_recipient not in recipients:
-        recipients.append(env_recipient)
-    
-    if sender and password and recipients:
-        try:
-            msg = MIMEMultipart()
-            msg['From'] = sender
-            msg['To'] = ", ".join(recipients)
-            msg['Subject'] = f"CryptoBot Daily Report - {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
-            msg.attach(MIMEText(report, 'plain'))
-            
-            with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as server:
-                server.starttls()
-                server.login(sender, password)
-                server.sendmail(sender, recipients, msg.as_string())
-            
-            logger.info(f"✅ Email sent to {len(recipients)} recipient(s)")
-            success = True
-        except Exception as e:
-            logger.error(f"❌ Email error: {e}")
-    
-    return success
-
-
-# =============================================================================
 # RETURNS DATA BUILDER
 # =============================================================================
 
@@ -585,17 +212,15 @@ def build_returns_df(db: Database, pairs: List[str], lookback_days: int = 90) ->
         try:
             df = db.get_ohlcv(pair, start=start_date)
             if df is not None and len(df) > 0:
-                # Resample to daily and calculate returns
                 daily = df['close'].resample('24h').last().ffill()
                 returns = daily.pct_change().dropna()
                 returns_data[pair] = returns
         except Exception as e:
-            logging.getLogger('paper_trader').warning(f"Could not load returns for {pair}: {e}")
+            logging.getLogger('trader').warning(f"Could not load returns for {pair}: {e}")
     
     if not returns_data:
         return pd.DataFrame()
     
-    # Combine and align
     returns_df = pd.DataFrame(returns_data)
     returns_df = returns_df.dropna(how='all')
     
@@ -603,67 +228,86 @@ def build_returns_df(db: Database, pairs: List[str], lookback_days: int = 90) ->
 
 
 # =============================================================================
-# PAPER TRADING RUNNER
+# TRADING RUNNER
 # =============================================================================
 
-class PaperTradingRunner:
+class TradingRunner:
     """
-    Paper trading runner for the 16-state strategy with Risk Parity sizing.
+    Trading runner using pluggable Strategy + Executor pattern.
     
-    Uses the SAME RiskParitySizer as the validated backtest to ensure
-    live trading matches backtest performance.
+    Strategy determines WHAT to trade (signal generation).
+    Executor determines HOW to trade (paper vs live).
     
-    Runs daily to:
-    1. Fetch latest data
-    2. Generate signals for each pair
-    3. Calculate Risk Parity weights
-    4. Size positions using validated logic
-    5. Log paper trades
-    6. Update portfolio snapshots
+    This separation allows:
+    - Same strategy for paper and live trading
+    - Easy addition of new strategies
+    - Clean testing of strategies before going live
     """
     
-    def __init__(self, config: dict, dry_run: bool = False):
+    def __init__(
+        self, 
+        config: dict, 
+        dry_run: bool = False,
+        strategy_name: str = 'momentum',
+        mode: str = 'paper'
+    ):
         """
         Initialize the runner.
         
         Args:
             config: Configuration dictionary
             dry_run: If True, don't write to database
+            strategy_name: Which strategy to use ('momentum', etc.)
+            mode: Execution mode ('paper' or 'live')
         """
         self.config = config
         self.dry_run = dry_run
+        self.mode = mode
+        self.strategy_name = strategy_name
         
         self.pairs = config['pairs']
-        self.strategy_name = config['strategy']['name']
-        self.min_training_months = config['strategy']['min_training_months']
-        self.use_filter = config['strategy']['use_ma72_filter']
-        
         self.initial_capital = config['position']['initial_capital']
         self.lookback_days = config['data']['lookback_days']
         self.trading_cost_bps = config['execution']['trading_cost_bps']
-        self.slippage_bps = config['execution'].get('slippage_bps', 5)  # Default 5 bps
+        self.slippage_bps = config['execution'].get('slippage_bps', 10)
         
-        # Initialize components
+        # Initialize database
         self.db = Database()
-        self.signal_generator = SignalGenerator(use_filter=self.use_filter)
+        self.logger = logging.getLogger('trader')
+        
+        # Initialize strategy
+        if strategy_name == 'momentum':
+            self.strategy = MomentumStrategy()
+            self.logger.info(f"Strategy: MomentumStrategy (validated 16-state)")
+        else:
+            raise ValueError(f"Unknown strategy: {strategy_name}")
+        
+        # Initialize executor
+        if mode == 'paper':
+            self.executor = PaperExecutor(
+                slippage_bps=self.slippage_bps,
+                commission_bps=self.trading_cost_bps,
+            )
+            self.logger.info(f"Executor: PaperExecutor (simulated)")
+        elif mode == 'live':
+            self.executor = LiveExecutor(KrakenAPI())
+            self.logger.info(f"Executor: LiveExecutor (REAL TRADING)")
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
         
         # Initialize Risk Parity Sizer
-        # Load config from risk_parity.yaml if available, else use defaults
         try:
             risk_parity_config_path = PROJECT_ROOT / "cryptobot" / "configs" / "risk" / "risk_parity.yaml"
             if risk_parity_config_path.exists():
                 self.sizer_config = RiskParityConfig.from_yaml(str(risk_parity_config_path))
-                # Override pairs from main config
                 self.sizer_config.pairs = self.pairs
             else:
                 self.sizer_config = RiskParityConfig(pairs=self.pairs)
         except Exception as e:
-            logging.getLogger('paper_trader').warning(f"Could not load risk_parity.yaml: {e}, using defaults")
+            self.logger.warning(f"Could not load risk_parity.yaml: {e}, using defaults")
             self.sizer_config = RiskParityConfig(pairs=self.pairs)
         
         self.sizer = RiskParitySizer(config=self.sizer_config)
-        
-        self.logger = logging.getLogger('paper_trader')
         
         # Track results for this run
         self.signals_generated = []
@@ -672,19 +316,25 @@ class PaperTradingRunner:
     
     def run(self) -> dict:
         """
-        Execute the daily paper trading run.
+        Execute the trading run.
         
         Returns:
             Summary dict with results
         """
         run_time = datetime.now(timezone.utc)
         run_time_melb = to_melbourne(run_time)
+        
         self.logger.info("=" * 60)
-        self.logger.info(f"PAPER TRADING RUN - {run_time_melb.strftime('%Y-%m-%d %H:%M:%S')} Melbourne")
+        self.logger.info(f"TRADING RUN - {run_time_melb.strftime('%Y-%m-%d %H:%M:%S')} Melbourne")
+        self.logger.info(f"Strategy: {self.strategy_name} | Mode: {self.mode.upper()}")
         self.logger.info("=" * 60)
         
         if self.dry_run:
             self.logger.info("*** DRY RUN MODE - No database writes ***")
+        
+        # Load persisted strategy state
+        loaded = self.strategy.load_state_for_pairs(self.db, self.pairs)
+        self.logger.info(f"Loaded strategy state for {loaded} pairs")
         
         # Get current equity (or initialize)
         equity = self._get_or_init_equity(run_time)
@@ -704,6 +354,9 @@ class PaperTradingRunner:
         # Calculate Risk Parity weights
         current_date = pd.Timestamp(run_time)
         self.risk_parity_weights = self.sizer.calculate_weights(returns_df, current_date)
+        
+        if not self.dry_run:
+            self.db.record_weights(self.risk_parity_weights, timestamp=run_time)
         
         self.logger.info("-" * 40)
         self.logger.info("RISK PARITY WEIGHTS:")
@@ -727,6 +380,8 @@ class PaperTradingRunner:
                     pair_data[pair] = data
             except Exception as e:
                 self.logger.error(f"Error processing {pair}: {e}")
+                import traceback
+                self.logger.debug(traceback.format_exc())
                 continue
         
         # Calculate all positions using Risk Parity
@@ -750,19 +405,21 @@ class PaperTradingRunner:
                 target_position=target_position,
                 price=data['price'],
                 signal_type=data['signal_type'],
-                hit_rate=data['hit_rate'],
-                filtered=data['filtered'],
-                details=data['details'],
+                state=data['state'],
+                duration=data['duration'],
                 equity=equity,
                 run_time=run_time
             )
         
-        # Update equity snapshot
-        self._update_equity(equity, run_time)
         
         # Summary
         summary = self._generate_summary()
         self._log_summary(summary)
+        
+        # Save strategy state for next run
+        if not self.dry_run:
+            saved = self.strategy.save_state(self.db)
+            self.logger.info(f"Saved strategy state for {saved} pairs")
         
         return summary
     
@@ -789,7 +446,7 @@ class PaperTradingRunner:
     
     def _get_pair_signal(self, pair: str, run_time: datetime) -> Optional[dict]:
         """
-        Get signal data for a single pair.
+        Get signal data for a single pair using the strategy.
         
         Returns:
             Dict with signal info, or None if insufficient data
@@ -798,58 +455,72 @@ class PaperTradingRunner:
         start_date = run_time - timedelta(days=self.lookback_days)
         df_1h = self.db.get_ohlcv(pair, start=start_date.isoformat())
         
-        if len(df_1h) < 168:  # Need at least 1 week of hourly data
-            self.logger.warning(f"{pair}: Insufficient data ({len(df_1h)} rows)")
+        if df_1h is None or len(df_1h) < 168:  # Need at least 1 week of hourly data
+            self.logger.warning(f"{pair}: Insufficient data ({len(df_1h) if df_1h is not None else 0} rows)")
             return None
         
         self.logger.info(f"{pair}: Loaded {len(df_1h)} hourly bars")
         
-        # 2. Generate signals
-        signals_df = self.signal_generator.generate_signals(df_1h)
-        returns = self.signal_generator.get_returns(df_1h)
+        # 2. Compute MAs for strategy
+        # Resample to get multi-timeframe MAs
+        df_24h = df_1h['close'].resample('24h').last().ffill()
+        df_72h = df_1h['close'].resample('72h').last().ffill()
+        df_168h = df_1h['close'].resample('168h').last().ffill()
         
-        if len(signals_df) == 0:
-            self.logger.warning(f"{pair}: No signals generated")
-            return None
-        
-        # Get signal for most recent date
-        latest_date = signals_df.index[-1]
-        data_start = signals_df.index[0]
-        
-        position, details = self.signal_generator.get_position_for_date(
-            signals_df, 
-            returns, 
-            latest_date, 
-            data_start,
-            self.min_training_months
-        )
-        
-        signal_type = details.get('simple_state', 'UNKNOWN')
-        hit_rate = details.get('hit_rate', 0.5)
-        filtered = details.get('filtered', False)
-        sufficient = details.get('sufficient', False)
+        ma_24h = df_24h.rolling(16).mean().iloc[-1]
+        ma_72h = df_72h.rolling(6).mean().iloc[-1]
+        ma_168h = df_168h.rolling(2).mean().iloc[-1]
         current_price = df_1h['close'].iloc[-1]
         
-        # Clear action description
-        if position == 1.0:
-            action = "INVEST (full)"
-        elif position == 0.5:
-            action = "SKIP (half - insufficient samples but bullish)"
+        # 3. Get signal from strategy
+        features = {
+            'pair': pair,
+            'price': current_price,
+            'ma_24h': ma_24h,
+            'ma_72h': ma_72h,
+            'ma_168h': ma_168h,
+        }
+        
+        position_multiplier = self.strategy.predict(features)
+        
+        # Get state info for logging
+        pair_state = self.strategy.get_pair_state(pair)
+        state_num = pair_state.confirmed_state if pair_state else 0
+        duration = pair_state.duration_hours if pair_state else 0
+        
+        # Map multiplier to signal type
+        if position_multiplier == 0:
+            if pair_state and pair_state.confirmed_state in {12, 14}:
+                signal_type = "EXCLUDED"
+            elif pair_state and pair_state.confirmed_state < 8:
+                signal_type = "BEARISH"
+            else:
+                signal_type = "FLAT"
+        elif position_multiplier == 1.5:
+            signal_type = "BOOSTED_LONG"
         else:
-            action = "AVOID (no position)"
+            signal_type = "LONG"
+        
+        # Determine action description
+        if position_multiplier == 1.5:
+            action = "🚀 BOOSTED LONG (150%)"
+        elif position_multiplier == 1.0:
+            action = "✅ LONG (100%)"
+        elif pair_state and pair_state.confirmed_state in {12, 14}:
+            action = "⛔ EXCLUDED (exhaustion state)"
+        else:
+            action = "⏸️ FLAT (bearish)"
         
         self.logger.info(
-            f"{pair}: {action} | State={signal_type}, HitRate={hit_rate:.1%}, "
-            f"Sufficient={sufficient}, Filtered={filtered}"
+            f"{pair}: {action} | State={state_num}, Duration={duration}h"
         )
         
         return {
-            'signal_position': position,
+            'signal_position': position_multiplier,
             'signal_type': signal_type,
-            'hit_rate': hit_rate,
-            'filtered': filtered,
             'price': current_price,
-            'details': details,
+            'state': state_num,
+            'duration': duration,
         }
     
     def _process_pair_trade(
@@ -858,9 +529,8 @@ class PaperTradingRunner:
         target_position: float,
         price: float,
         signal_type: str,
-        hit_rate: float,
-        filtered: bool,
-        details: dict,
+        state: int,
+        duration: int,
         equity: dict,
         run_time: datetime,
     ):
@@ -873,19 +543,18 @@ class PaperTradingRunner:
                 strategy=self.strategy_name,
                 signal=signal_type,
                 target_position=target_position,
-                confidence=hit_rate,
-                regime=self._encode_state(details),
-                prediction=hit_rate,
+                confidence=0.55 if target_position > 0 else 0.45,
+                regime=state,
+                prediction=0.55 if target_position > 0 else 0.45,
                 timestamp=run_time
             )
         
         self.signals_generated.append({
             'pair': pair,
             'signal': signal_type,
-            'position': details.get('simple_position', 0),
+            'state': state,
+            'duration': duration,
             'target_position': target_position,
-            'hit_rate': hit_rate,
-            'filtered': filtered,
             'weight': self.risk_parity_weights.get(pair, 0),
         })
         
@@ -897,7 +566,7 @@ class PaperTradingRunner:
         position_diff = target_position - current_position
         
         if abs(position_diff) > 0.001:  # Threshold to avoid tiny trades
-            self._execute_paper_trade(
+            self._execute_trade(
                 pair=pair,
                 current_position=current_position,
                 target_position=target_position,
@@ -922,7 +591,7 @@ class PaperTradingRunner:
                 timestamp=run_time
             )
     
-    def _execute_paper_trade(
+    def _execute_trade(
         self,
         pair: str,
         current_position: float,
@@ -931,55 +600,61 @@ class PaperTradingRunner:
         signal_type: str,
         run_time: datetime
     ):
-        """Execute a paper trade (log and record)."""
+        """Execute trade via executor (paper or live)."""
         
-        position_diff = target_position - current_position
-        direction = "BUY" if position_diff > 0 else "SELL"
-        size = abs(position_diff)
-        value = size * price
-        
-        # Calculate costs and slippage
-        trading_cost = value * (self.trading_cost_bps / 10000)
-        slippage = value * (self.slippage_bps / 10000)
-        total_cost = trading_cost + slippage
-        
-        self.logger.info(
-            f"{pair}: PAPER TRADE - {direction} {size:.6f} @ ${price:,.2f} "
-            f"(value: ${value:,.2f}, cost: ${trading_cost:.2f}, slippage: ${slippage:.2f})"
+        # Create order
+        order = Order.from_target_position(
+            pair=pair,
+            current_position=current_position,
+            target_position=target_position,
+            timestamp=run_time,
+            reference_price=price,
+            reason=signal_type,
         )
         
+        if order is None:
+            return  # No position change needed
+        
+        # Create bar for executor
+        bar = Bar(
+            timestamp=run_time,
+            pair=pair,
+            open=price,
+            high=price,
+            low=price,
+            close=price,
+            volume=0,
+        )
+        
+        # Execute via executor (paper or live - same interface!)
+        fill = self.executor.execute(order, bar)
+        
+        # Record to database
         if not self.dry_run:
+            trade_type = classify_trade(current_position, target_position)
             self.db.record_trade(
                 pair=pair,
                 strategy=self.strategy_name,
-                direction=direction,
-                size=size,
-                price=price,
+                direction=order.side.value.upper(),
+                size=fill.fill_size,
+                price=fill.fill_price,
                 slippage_bps=self.slippage_bps,
-                transaction_cost=total_cost,
-                execution_type="paper",
-                notes=f"Signal: {signal_type}, Weight: {self.risk_parity_weights.get(pair, 0):.1%}"
+                transaction_cost=fill.total_cost,
+                execution_type=self.mode,
+                notes=f"Signal: {signal_type}, Weight: {self.risk_parity_weights.get(pair, 0):.1%}",
+                trade_type=trade_type
             )
         
         self.trades_executed.append({
             'pair': pair,
-            'direction': direction,
-            'size': size,
-            'price': price,
-            'value': value,
-            'cost': total_cost,
-            'trading_cost': trading_cost,
-            'slippage': slippage,
+            'direction': order.side.value.upper(),
+            'size': fill.fill_size,
+            'price': fill.fill_price,
+            'value': fill.notional_value,
+            'cost': fill.total_cost,
+            'trading_cost': fill.commission,
+            'slippage': fill.slippage,
         })
-    
-    def _encode_state(self, details: dict) -> int:
-        """Encode state tuple as integer for storage."""
-        state = details.get('active_state')
-        if state is None:
-            return None
-        
-        # Encode 4-tuple as single int: t24*8 + t168*4 + ma72*2 + ma168
-        return state[0]*8 + state[1]*4 + state[2]*2 + state[3]
     
     def _update_equity(self, equity: dict, run_time: datetime):
         """Update equity snapshot after all trades."""
@@ -992,27 +667,28 @@ class PaperTradingRunner:
         
         # Calculate invested value
         invested = 0.0
-        unrealized_pnl = 0.0
         
-        if len(positions_df) > 0:
+        if positions_df is not None and len(positions_df) > 0:
             for _, row in positions_df.iterrows():
-                if row['position'] and row['position'] != 0 and row['current_price']:
-                    invested += abs(row['position'] * row['current_price'])
-                    if row['unrealized_pnl']:
-                        unrealized_pnl += row['unrealized_pnl']
+                if row['position'] and row['position'] != 0:
+                    live_price = self.db.get_latest_price(row['pair'])
+                    if live_price:
+                        invested += abs(row['position'] * live_price)
+                    elif row['current_price']:
+                        invested += abs(row['position'] * row['current_price'])
         
         # Calculate cash change from today's trades
         cash_change = 0.0
         for t in self.trades_executed:
             if t['direction'] == 'BUY':
-                cash_change -= t['value']  # Buying reduces cash
+                cash_change -= t['value']
             else:
-                cash_change += t['value']  # Selling increases cash
-            cash_change -= t['cost']  # Costs always reduce cash
+                cash_change += t['value']
+            cash_change -= t['cost']
         
         # Update equity
         cash = equity['cash'] + cash_change
-        total_equity = cash + invested + unrealized_pnl
+        total_equity = cash + invested
         
         # Track peak and drawdown
         peak_equity = max(equity.get('peak_equity', total_equity), total_equity)
@@ -1038,6 +714,8 @@ class PaperTradingRunner:
         """Generate run summary."""
         return {
             'run_time': datetime.now(timezone.utc).isoformat(),
+            'strategy': self.strategy_name,
+            'mode': self.mode,
             'pairs_processed': len(self.signals_generated),
             'signals': self.signals_generated,
             'trades_executed': len(self.trades_executed),
@@ -1048,19 +726,21 @@ class PaperTradingRunner:
             'total_slippage': sum(t.get('slippage', 0) for t in self.trades_executed),
             'risk_parity_weights': self.risk_parity_weights.copy(),
             'sizer_stats': self.sizer.get_stats(),
+            'active_boosts': self.strategy.get_active_boosts() if hasattr(self.strategy, 'get_active_boosts') else [],
+            'excluded_pairs': self.strategy.get_excluded_pairs() if hasattr(self.strategy, 'get_excluded_pairs') else [],
         }
     
     def _log_summary(self, summary: dict):
-        """Log run summary matching email report format."""
+        """Log run summary."""
         self.logger.info("=" * 60)
         self.logger.info("RUN SUMMARY")
         self.logger.info("=" * 60)
         
-        # Get current equity and positions for full report
+        # Get current equity and positions
         equity = self.db.get_latest_equity()
         positions_df = self.db.get_current_positions()
         
-        # Calculate invested value from positions
+        # Calculate invested value
         invested_value = 0.0
         if positions_df is not None and len(positions_df) > 0:
             for _, p in positions_df.iterrows():
@@ -1087,7 +767,7 @@ class PaperTradingRunner:
             self.logger.info(f"  Current Drawdown:       {drawdown_pct:>10.2f}%")
             self.logger.info(f"  Max Allowed DD:         {self.config['risk']['max_drawdown']*100:>10.1f}%")
         
-        # Calculate and log VaR
+        # VaR
         var_metrics = calculate_var(self.db, self.pairs)
         self.logger.info(f"  VaR (95%, 1-day):       ${var_metrics.get('var_95', 0):>10,.2f}")
         self.logger.info(f"  VaR (99%, 1-day):       ${var_metrics.get('var_99', 0):>10,.2f}")
@@ -1126,16 +806,27 @@ class PaperTradingRunner:
         self.logger.info("SIGNALS:")
         if self.signals_generated:
             for sig in self.signals_generated:
-                if sig['signal'] in ['STRONG_BUY', 'BUY']:
+                if sig['signal'] == 'BOOSTED_LONG':
+                    status = "🚀"
+                elif sig['signal'] == 'LONG':
                     status = "✅"
-                elif sig['signal'] in ['SELL', 'STRONG_SELL']:
+                elif sig['signal'] == 'EXCLUDED':
                     status = "⛔"
                 else:
                     status = "⏸️"
                 self.logger.info(
                     f"  {status} {sig['pair']:8s}: {sig['signal']:12s} "
-                    f"(HR: {sig['hit_rate']:.1%}, Target: {sig['target_position']:.2f})"
+                    f"(S{sig['state']}, {sig['duration']}h, Target: {sig['target_position']:.4f})"
                 )
+        
+        # BOOST STATUS
+        if summary.get('active_boosts'):
+            self.logger.info("-" * 40)
+            self.logger.info(f"🚀 ACTIVE BOOSTS: {', '.join(summary['active_boosts'])}")
+        
+        if summary.get('excluded_pairs'):
+            self.logger.info("-" * 40)
+            self.logger.info(f"⛔ EXCLUDED (S12/14): {', '.join(summary['excluded_pairs'])}")
         
         # RISK PARITY WEIGHTS
         self.logger.info("-" * 40)
@@ -1152,13 +843,27 @@ def main():
     """Main entry point."""
     
     parser = argparse.ArgumentParser(
-        description='CryptoBot Paper Trading Runner (Risk Parity)'
+        description='CryptoBot Trading Runner (Strategy + Executor Pattern)'
     )
     parser.add_argument(
         '--config', '-c',
         type=str,
         default=None,
         help='Path to config file (default: apps/live/config.yaml)'
+    )
+    parser.add_argument(
+        '--strategy', '-s',
+        type=str,
+        default='momentum',
+        choices=['momentum'],
+        help='Trading strategy (default: momentum)'
+    )
+    parser.add_argument(
+        '--mode', '-m',
+        type=str,
+        default='paper',
+        choices=['paper', 'live'],
+        help='Execution mode (default: paper)'
     )
     parser.add_argument(
         '--dry-run', '-n',
@@ -1168,13 +873,13 @@ def main():
     parser.add_argument(
         '--hourly',
         action='store_true',
-        help='Hourly mode: update data every run, trade only at 00:xx Melbourne'
+        help='Hourly mode: update data first, then run trading logic'
     )
     parser.add_argument(
-        '--trading-hour',
+        '--report-hour',
         type=int,
         default=0,
-        help='Hour (Melbourne time) to run trading (default: 0 = midnight)'
+        help='Hour (Melbourne time) to send daily report (default: 0 = midnight)'
     )
     
     args = parser.parse_args()
@@ -1191,44 +896,47 @@ def main():
     log_level = config.get('logging', {}).get('level', 'INFO')
     logger = setup_logging(log_file, log_level)
     
-    # Get current hour in Melbourne for trading decision
+    # Get current hour in Melbourne for report decision
     current_hour_melbourne = melbourne_now().hour
     
     logger.info("=" * 60)
     logger.info(f"CryptoBot Runner Started: {melbourne_now().strftime('%Y-%m-%d %H:%M:%S')} Melbourne")
-    logger.info(f"Mode: {'HOURLY' if args.hourly else 'DIRECT'}")
-    logger.info(f"Sizing: RiskParitySizer (validated)")
+    logger.info(f"Strategy: {args.strategy} | Mode: {args.mode.upper()}")
+    logger.info(f"Schedule: {'HOURLY' if args.hourly else 'DIRECT'}")
     logger.info("=" * 60)
     
     try:
+        # STEP 1: Update data if --hourly flag is set
         if args.hourly:
-            # HOURLY MODE
-            # 1. Always update data
             update_data(config, logger)
-            
-            # 2. Trade only at specified hour (Melbourne time)
-            if current_hour_melbourne == args.trading_hour:
-                logger.info("-" * 40)
-                logger.info(f"TRADING HOUR ({args.trading_hour}:xx Melbourne) - Running trades...")
-                logger.info("-" * 40)
-                
-                runner = PaperTradingRunner(config, dry_run=args.dry_run)
-                summary = runner.run()
-                
-                # 3. Send report after trading
-                send_report(runner.db, config, summary, logger)
-            else:
-                logger.info(f"Not trading hour (current: {current_hour_melbourne}, trading: {args.trading_hour})")
-                logger.info("Data updated. Skipping trades.")
         
-        else:
-            # DIRECT MODE - just run trading
-            runner = PaperTradingRunner(config, dry_run=args.dry_run)
-            summary = runner.run()
-            
-            # Optionally send report
+        # STEP 2: Always run trading logic
+        # The 3h confirmation is inside MomentumStrategy - we must check every hour
+        # to catch when confirmation triggers
+        logger.info("-" * 40)
+        logger.info("RUNNING TRADING LOGIC...")
+        logger.info("-" * 40)
+        
+        runner = TradingRunner(
+            config,
+            dry_run=args.dry_run,
+            strategy_name=args.strategy,
+            mode=args.mode,
+        )
+        summary = runner.run()
+        
+        # STEP 3: Send daily report at specified hour only
+        if args.hourly and current_hour_melbourne == args.report_hour:
             if config.get('notifications', {}).get('enabled'):
-                send_report(runner.db, config, summary, logger)
+                logger.info("-" * 40)
+                logger.info(f"SENDING DAILY REPORT (hour={args.report_hour})")
+                logger.info("-" * 40)
+                report = DailyReport(runner.db, config)
+                sender = ReportSender(config)
+                sender.send_all(
+                    report.generate(),
+                    subject=f"CryptoBot {args.strategy.title()} Report - {melbourne_now().strftime('%Y-%m-%d')}"
+                )
         
         logger.info("=" * 60)
         logger.info("Runner completed successfully")
