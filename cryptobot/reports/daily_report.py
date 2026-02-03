@@ -2,28 +2,22 @@
 """
 CryptoBot - Daily Report Generator
 ==================================
-Database-driven daily report generation.
-
-Pulls all data from database tables:
-- equity: Current equity snapshot
-- portfolio: Current positions
-- signals: Latest signals per pair
-- trades: Today's executed trades
-- ohlcv: Current prices
+Partner-friendly daily report with clear, non-technical language.
 
 Usage:
     from cryptobot.reports.daily_report import DailyReport
     
     report = DailyReport(db, config)
     content = report.generate()
-    print(content)
 """
 
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from .pair_names import get_friendly_name, format_holding
 
 # Timezone handling
 try:
@@ -39,49 +33,80 @@ def melbourne_now() -> datetime:
     return datetime.now(MELBOURNE_TZ)
 
 
+def to_melbourne(dt: datetime) -> datetime:
+    """Convert datetime to Melbourne timezone."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(MELBOURNE_TZ)
+
+
 @dataclass
-class ReportData:
-    """Container for all report data."""
+class TradeDetail:
+    """Individual trade record for reporting."""
+    timestamp: datetime
+    pair: str
+    friendly_name: str
+    direction: str  # BUY or SELL
+    trade_type: str  # ENTRY, EXIT, INCREASE, DECREASE
+    size: float
+    price: float
+    value: float
+    cost: float
+
+
+@dataclass
+class DailyReportData:
+    """Container for daily report data."""
     timestamp: datetime
     
-    # Equity
+    # Portfolio values
     total_equity: float
-    cash: float
-    invested: float
-    daily_pnl: float
-    drawdown: float
-    peak_equity: float
+    yesterday_equity: float
+    daily_change: float
+    daily_change_pct: float
     
-    # Positions
-    positions: List[Dict[str, Any]]
+    # Performance periods
+    week_change: float
+    week_change_pct: float
+    month_change: float
+    month_change_pct: float
+    inception_change: float
+    inception_change_pct: float
     
-    # Signals
-    signals: List[Dict[str, Any]]
+    # Risk
+    drawdown_pct: float
+    max_drawdown_pct: float
+    risk_status: str
     
-    # Trades
-    trades: List[Dict[str, Any]]
+    # Activity
+    trades_total: int
+    trades_entry: int
+    trades_exit: int
+    trades_rebalance: int
+    total_costs: float
     
-    # Risk metrics
-    var_95: float
-    var_99: float
-    portfolio_vol: float
+    # Individual trades
+    trades: List[TradeDetail] = field(default_factory=list)
+    
+    # Holdings
+    holdings: List[Dict[str, Any]] = field(default_factory=list)
+    cash: float = 0.0
     
     # Config
-    max_drawdown: float
-    pairs: List[str]
+    inception_date: datetime = None
 
 
 class DailyReport:
     """
-    Database-driven daily report generator.
+    Partner-friendly daily report generator.
     
-    All data is pulled fresh from the database, ensuring
-    reports are accurate regardless of when they're generated.
+    Pulls live data from database and formats in clear,
+    non-technical language suitable for partners.
     """
     
     def __init__(self, db, config: dict):
         """
-        Initialise daily report generator.
+        Initialize daily report generator.
         
         Args:
             db: Database instance
@@ -90,415 +115,410 @@ class DailyReport:
         self.db = db
         self.config = config
         self.pairs = config.get('pairs', [])
+        self.initial_capital = config.get('position', {}).get('initial_capital', 100000)
+        self.max_drawdown = config.get('risk', {}).get('max_drawdown', 0.20)
+        
+        # Inception date - set this when starting fresh
+        self.inception_date = config.get('inception_date')
+        if isinstance(self.inception_date, str):
+            self.inception_date = pd.to_datetime(self.inception_date)
     
-    def gather_data(self) -> ReportData:
-        """
-        Gather all data needed for the report from database.
-        
-        Calculates LIVE mark-to-market equity rather than using
-        potentially stale values from equity table.
-        
-        Returns:
-            ReportData with all fields populated
-        """
+    def gather_data(self) -> DailyReportData:
+        """Gather all data needed for the daily report."""
         now = melbourne_now()
         
-        # Get last recorded equity (for peak equity reference)
-        equity = self._get_equity()
+        # Get current equity
+        current_equity = self._get_current_equity()
+        total_equity = current_equity.get('total_equity', self.initial_capital)
         
-        # Get positions with current prices (live mark-to-market)
-        positions = self._get_positions_with_prices()
+        # Get historical equity for comparisons
+        yesterday_equity = self._get_equity_days_ago(1)
+        week_ago_equity = self._get_equity_days_ago(7)
+        month_ago_equity = self._get_equity_days_ago(30)
+        inception_equity = self.initial_capital
         
-        # Calculate LIVE values
-        invested = sum(p['value'] for p in positions if p['value'])
-        unrealised_pnl = sum(p['unrealised_pnl'] for p in positions)
+        # Calculate changes
+        daily_change = total_equity - yesterday_equity
+        daily_change_pct = (daily_change / yesterday_equity * 100) if yesterday_equity else 0
         
-        # Calculate cash from first principles:
-        # cash = initial_capital - cost_of_positions - trading_costs
-        initial_capital = self.config.get('position', {}).get('initial_capital', 100000)
+        week_change = total_equity - week_ago_equity
+        week_change_pct = (week_change / week_ago_equity * 100) if week_ago_equity else 0
         
-        # Cost of positions = sum(entry_price × position_size)
-        cost_of_positions = sum(
-            p['entry_price'] * abs(p['position']) 
-            for p in positions 
-            if p['entry_price'] and p['position']
-        )
+        month_change = total_equity - month_ago_equity
+        month_change_pct = (month_change / month_ago_equity * 100) if month_ago_equity else 0
         
-        # Estimate total trading costs paid
-        trading_cost_bps = self.config.get('execution', {}).get('trading_cost_bps', 20)
-        slippage_bps = self.config.get('execution', {}).get('slippage_bps', 5)
-        total_cost_bps = trading_cost_bps + slippage_bps
-        estimated_costs = cost_of_positions * (total_cost_bps / 10000)
+        inception_change = total_equity - inception_equity
+        inception_change_pct = (inception_change / inception_equity * 100) if inception_equity else 0
         
-        # Current cash
-        cash = initial_capital - cost_of_positions - estimated_costs
+        # Risk status
+        peak_equity = current_equity.get('peak_equity', total_equity)
+        drawdown_pct = ((peak_equity - total_equity) / peak_equity * 100) if peak_equity else 0
         
-        # LIVE total equity = cash + position values (mark-to-market)
-        total_equity = cash + invested
-        
-        # Get peak equity for drawdown calculation
-        peak_equity = equity.get('peak_equity', initial_capital) if equity else initial_capital
-        peak_equity = max(peak_equity, total_equity)  # Update if new high
-        
-        # Calculate LIVE drawdown from peak
-        if peak_equity > 0:
-            drawdown = (peak_equity - total_equity) / peak_equity
+        if drawdown_pct < self.max_drawdown * 50:  # Less than 50% of limit
+            risk_status = "Normal operations"
+        elif drawdown_pct < self.max_drawdown * 80:  # Less than 80% of limit
+            risk_status = "Elevated - monitoring closely"
         else:
-            drawdown = 0
+            risk_status = "⚠️ High - approaching limits"
         
-        # Calculate LIVE daily P&L
-        # Compare current equity to last recorded equity (or initial if none)
-        if equity:
-            previous_equity = equity.get('total_equity', initial_capital)
-        else:
-            previous_equity = initial_capital
-        daily_pnl = total_equity - previous_equity
+        # Today's trades (summary and details)
+        trade_summary, trade_details = self._get_todays_trades()
         
-        # Get today's trades for display
-        trades = self._get_todays_trades()
+        # Current holdings with live prices
+        holdings, cash = self._get_holdings()
         
-        # Get signals (latest per pair)
-        signals = self._get_latest_signals()
-        
-        # Calculate VaR using live equity
-        live_equity = {'total_equity': total_equity, 'peak_equity': peak_equity}
-        var_metrics = self._calculate_var(live_equity, positions)
-        
-        return ReportData(
+        return DailyReportData(
             timestamp=now,
             total_equity=total_equity,
+            yesterday_equity=yesterday_equity,
+            daily_change=daily_change,
+            daily_change_pct=daily_change_pct,
+            week_change=week_change,
+            week_change_pct=week_change_pct,
+            month_change=month_change,
+            month_change_pct=month_change_pct,
+            inception_change=inception_change,
+            inception_change_pct=inception_change_pct,
+            drawdown_pct=drawdown_pct,
+            max_drawdown_pct=self.max_drawdown * 100,
+            risk_status=risk_status,
+            trades_total=trade_summary['total'],
+            trades_entry=trade_summary['entry'],
+            trades_exit=trade_summary['exit'],
+            trades_rebalance=trade_summary['rebalance'],
+            total_costs=trade_summary['costs'],
+            trades=trade_details,
+            holdings=holdings,
             cash=cash,
-            invested=invested,
-            daily_pnl=daily_pnl,
-            drawdown=drawdown,
-            peak_equity=peak_equity,
-            positions=positions,
-            signals=signals,
-            trades=trades,
-            var_95=var_metrics.get('var_95', 0),
-            var_99=var_metrics.get('var_99', 0),
-            portfolio_vol=var_metrics.get('portfolio_vol', 0),
-            max_drawdown=self.config.get('risk', {}).get('max_drawdown', 0.20),
-            pairs=self.pairs,
+            inception_date=self.inception_date,
         )
     
-    def _get_equity(self) -> Optional[Dict]:
-        """Get latest equity snapshot."""
-        return self.db.get_latest_equity()
+    def _get_current_equity(self) -> Dict:
+        """Get current equity with live mark-to-market."""
+        # Get positions with live prices
+        holdings, cash = self._get_holdings()
+        
+        invested = sum(h['value'] for h in holdings)
+        total_equity = cash + invested
+        
+        # Get peak from database
+        db_equity = self.db.get_latest_equity()
+        peak_equity = db_equity.get('peak_equity', total_equity) if db_equity else total_equity
+        peak_equity = max(peak_equity, total_equity)
+        
+        return {
+            'total_equity': total_equity,
+            'cash': cash,
+            'invested': invested,
+            'peak_equity': peak_equity,
+        }
     
-    def _get_positions_with_prices(self) -> List[Dict]:
-        """
-        Get current positions with live prices and calculated P&L.
+    def _get_equity_days_ago(self, days: int) -> float:
+        """Get equity value from N days ago."""
+        target_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         
-        Fetches current prices from ohlcv table and calculates
-        unrealised P&L based on entry price.
-        """
-        positions = []
+        try:
+            df = self.db.get_equity_history(start=target_date)
+            if df is not None and len(df) > 0:
+                return df['total_equity'].iloc[0]
+        except Exception:
+            pass
         
-        # Get positions from portfolio table
+        return self.initial_capital
+    
+    def _get_holdings(self) -> tuple:
+        """
+        Get current holdings with live prices.
+        
+        Returns:
+            Tuple of (holdings list, cash balance)
+        """
+        holdings = []
+        
         positions_df = self.db.get_current_positions()
         
         if positions_df is None or len(positions_df) == 0:
-            return positions
+            return holdings, self.initial_capital
+        
+        total_invested = 0
         
         for _, row in positions_df.iterrows():
             pair = row['pair']
             position = row['position'] or 0
             entry_price = row['entry_price']
             
-            # Skip zero positions
             if abs(position) < 0.0001:
                 continue
             
-            # Get current price from database
+            # Get LIVE price from OHLCV
             current_price = self.db.get_latest_price(pair)
             if current_price is None:
                 current_price = row.get('current_price', 0)
             
-            # Calculate value and P&L
             value = abs(position * current_price) if current_price else 0
+            total_invested += value
             
-            if entry_price and current_price and position:
-                unrealised_pnl = position * (current_price - entry_price)
-            else:
-                unrealised_pnl = 0
-            
-            positions.append({
+            holdings.append({
                 'pair': pair,
+                'friendly_name': get_friendly_name(pair),
                 'position': position,
-                'entry_price': entry_price,
                 'current_price': current_price,
                 'value': value,
-                'unrealised_pnl': unrealised_pnl,
             })
         
-        return positions
+        # Sort by value descending
+        holdings.sort(key=lambda x: x['value'], reverse=True)
+        
+        # Calculate percentages
+        total_value = total_invested + self._get_cash_balance(total_invested)
+        for h in holdings:
+            h['percentage'] = (h['value'] / total_value * 100) if total_value else 0
+        
+        cash = self._get_cash_balance(total_invested)
+        
+        return holdings, cash
     
-    def _get_latest_signals(self) -> List[Dict]:
-        """
-        Get latest signal for each pair.
-        
-        Queries signals table for the most recent signal per pair.
-        """
-        signals = []
-        
-        for pair in self.pairs:
-            signal = self.db.get_latest_signal(pair)
-            if signal:
-                # Convert confidence to hit rate percentage
-                hit_rate = signal.get('confidence', 0)
-                
-                signals.append({
-                    'pair': pair,
-                    'signal': signal.get('signal', 'UNKNOWN'),
-                    'hit_rate': hit_rate,
-                    'target_position': signal.get('target_position', 0),
-                    'regime': signal.get('regime'),
-                    'timestamp': signal.get('timestamp'),
-                })
-            else:
-                signals.append({
-                    'pair': pair,
-                    'signal': 'NO_DATA',
-                    'hit_rate': 0,
-                    'target_position': 0,
-                    'regime': None,
-                    'timestamp': None,
-                })
-        
-        return signals
+    def _get_cash_balance(self, invested: float) -> float:
+        """Calculate cash balance."""
+        db_equity = self.db.get_latest_equity()
+        if db_equity and db_equity.get('total_equity'):
+            return db_equity['total_equity'] - invested
+        return self.initial_capital - invested
     
-    def _get_todays_trades(self) -> List[Dict]:
-        """Get trades executed today (Melbourne time)."""
-        # Get start of today Melbourne time, convert to UTC for query
-        today_melb = melbourne_now().replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        trades_df = self.db.get_trades(start=today_melb.isoformat())
-        
-        trades = []
-        if trades_df is not None and len(trades_df) > 0:
-            for _, row in trades_df.iterrows():
-                trades.append({
-                    'pair': row['pair'],
-                    'direction': row['direction'],
-                    'size': row['size'],
-                    'price': row['price'],
-                    'timestamp': row.get('timestamp'),
-                })
-        
-        return trades
-    
-    def _get_trades_since(self, since_timestamp) -> List[Dict]:
-        """Get all trades since a given timestamp."""
-        trades_df = self.db.get_trades(start=since_timestamp.isoformat() if hasattr(since_timestamp, 'isoformat') else str(since_timestamp))
-        
-        trades = []
-        if trades_df is not None and len(trades_df) > 0:
-            for _, row in trades_df.iterrows():
-                trades.append({
-                    'pair': row['pair'],
-                    'direction': row['direction'],
-                    'size': row['size'],
-                    'price': row['price'],
-                    'timestamp': row.get('timestamp'),
-                })
-        
-        return trades
-    
-    def _calculate_var(self, equity: Dict, positions: List[Dict]) -> Dict:
+    def _get_todays_trades(self) -> tuple:
         """
-        Calculate Value at Risk metrics.
-        
-        Uses historical simulation with 1-year lookback.
-        """
-        try:
-            if not equity or not positions:
-                return {'var_95': 0, 'var_99': 0, 'portfolio_vol': 0}
-            
-            total_invested = sum(p['value'] for p in positions)
-            if total_invested <= 0:
-                return {'var_95': 0, 'var_99': 0, 'portfolio_vol': 0}
-            
-            # Get historical returns
-            returns_data = {}
-            start_date = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
-            
-            for pair in self.pairs:
-                df = self.db.get_ohlcv(pair, start=start_date)
-                if df is not None and len(df) > 0:
-                    daily = df['close'].resample('24h').last().ffill().pct_change().dropna()
-                    returns_data[pair] = daily
-            
-            if not returns_data:
-                return {'var_95': 0, 'var_99': 0, 'portfolio_vol': 0}
-            
-            returns_df = pd.DataFrame(returns_data).dropna()
-            
-            if len(returns_df) < 30:
-                return {'var_95': 0, 'var_99': 0, 'portfolio_vol': 0}
-            
-            # Get position weights
-            weights = {}
-            for p in positions:
-                if p['pair'] in returns_df.columns and p['value']:
-                    weights[p['pair']] = p['value'] / total_invested
-            
-            if not weights:
-                return {'var_95': 0, 'var_99': 0, 'portfolio_vol': 0}
-            
-            # Portfolio returns
-            portfolio_returns = sum(
-                returns_df[pair] * weight
-                for pair, weight in weights.items()
-                if pair in returns_df.columns
-            )
-            
-            # VaR calculations (1-day horizon)
-            var_95 = np.percentile(portfolio_returns, 5)  # 5th percentile for losses
-            var_99 = np.percentile(portfolio_returns, 1)  # 1st percentile
-            portfolio_vol = portfolio_returns.std() * np.sqrt(252)
-            
-            total_equity = equity.get('total_equity', total_invested)
-            
-            return {
-                'var_95': abs(var_95 * total_equity),
-                'var_99': abs(var_99 * total_equity),
-                'portfolio_vol': portfolio_vol,
-            }
-        
-        except Exception as e:
-            print(f"VaR calculation error: {e}")
-            return {'var_95': 0, 'var_99': 0, 'portfolio_vol': 0}
-    
-    def generate(self) -> str:
-        """
-        Generate the full daily report.
+        Get today's trade summary and details.
         
         Returns:
-            Formatted report string
+            Tuple of (summary dict, list of TradeDetail)
         """
+        today_start = melbourne_now().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        trades_df = self.db.get_trades(start=today_start.isoformat())
+        
+        summary = {
+            'total': 0,
+            'entry': 0,
+            'exit': 0,
+            'rebalance': 0,
+            'costs': 0.0,
+        }
+        
+        trade_details = []
+        
+        if trades_df is None or len(trades_df) == 0:
+            return summary, trade_details
+        
+        summary['total'] = len(trades_df)
+        summary['costs'] = trades_df['transaction_cost'].sum() if 'transaction_cost' in trades_df else 0
+        
+        if 'trade_type' in trades_df.columns:
+            type_counts = trades_df['trade_type'].value_counts()
+            summary['entry'] = type_counts.get('ENTRY', 0)
+            summary['exit'] = type_counts.get('EXIT', 0)
+            summary['rebalance'] = type_counts.get('INCREASE', 0) + type_counts.get('DECREASE', 0)
+        else:
+            summary['rebalance'] = summary['total']
+        
+        # Build individual trade details
+        for _, row in trades_df.iterrows():
+            # Get timestamp and convert to Melbourne
+            ts = row.get('timestamp') or row.get('created_at')
+            if ts is not None:
+                if isinstance(ts, str):
+                    ts = pd.to_datetime(ts)
+                ts = to_melbourne(ts)
+            else:
+                ts = melbourne_now()
+            
+            pair = row.get('pair', 'UNKNOWN')
+            direction = row.get('direction', 'BUY')
+            trade_type = row.get('trade_type', 'TRADE')
+            size = row.get('size', 0)
+            price = row.get('price', 0)
+            value = abs(size * price) if size and price else 0
+            cost = row.get('transaction_cost', 0)
+            
+            trade_details.append(TradeDetail(
+                timestamp=ts,
+                pair=pair,
+                friendly_name=get_friendly_name(pair),
+                direction=direction,
+                trade_type=trade_type,
+                size=size,
+                price=price,
+                value=value,
+                cost=cost,
+            ))
+        
+        # Sort by timestamp (oldest first)
+        trade_details.sort(key=lambda x: x.timestamp)
+        
+        return summary, trade_details
+    
+    def generate(self) -> str:
+        """Generate the formatted daily report."""
         data = self.gather_data()
         return self._format_report(data)
     
-    def _format_report(self, data: ReportData) -> str:
-        """Format report data into readable string."""
+    def _format_report(self, data: DailyReportData) -> str:
+        """Format report data into partner-friendly string."""
+        
+        # Day name for header
+        day_name = data.timestamp.strftime('%A, %d %B %Y')
         
         lines = [
             "=" * 50,
             "📊 CRYPTOBOT DAILY REPORT",
-            f"📅 {data.timestamp.strftime('%Y-%m-%d')}",
-            f"⏰ {data.timestamp.strftime('%H:%M:%S')} Melbourne",
+            f"📅 {day_name}",
             "=" * 50,
             "",
-            "💰 EQUITY",
-            "-" * 30,
-            f"  Total Equity Value:    ${data.total_equity:>12,.2f}",
-            f"  Cash Balance:          ${data.cash:>12,.2f}",
-            f"  Invested Value:        ${data.invested:>12,.2f}",
-            f"  Daily P&L (24h):       ${data.daily_pnl:>+12,.2f}",
+            "💰 PORTFOLIO VALUE",
+            f"   Today:           ${data.total_equity:>14,.2f}",
+            f"   Yesterday:       ${data.yesterday_equity:>14,.2f}",
+            f"   Daily Change:    ${data.daily_change:>+14,.2f} ({data.daily_change_pct:+.2f}%)",
             "",
-            "📉 RISK METRICS",
-            "-" * 30,
-            f"  Current Drawdown:      {data.drawdown * 100:>10.2f}%",
-            f"  Max Allowed DD:        {data.max_drawdown * 100:>10.1f}%",
-            f"  VaR (95%, 1-day):      ${data.var_95:>10,.2f}",
-            f"  VaR (99%, 1-day):      ${data.var_99:>10,.2f}",
-            f"  Portfolio Vol:         {data.portfolio_vol * 100:>10.1f}% ann.",
+            "📈 PERFORMANCE",
+            f"   This Week:       ${data.week_change:>+14,.2f} ({data.week_change_pct:+.2f}%)",
+            f"   This Month:      ${data.month_change:>+14,.2f} ({data.month_change_pct:+.2f}%)",
+            f"   Since Start:     ${data.inception_change:>+14,.2f} ({data.inception_change_pct:+.2f}%)",
             "",
-            "📈 TODAY'S TRADES",
-            "-" * 30,
+            "📉 RISK STATUS",
         ]
         
-        if data.trades:
-            lines.append(f"  Trades Executed: {len(data.trades)}")
-            total_value = sum(t['size'] * t['price'] for t in data.trades)
-            lines.append(f"  Total Value:     ${total_value:,.2f}")
-            lines.append("")
-            for t in data.trades:
-                value = t['size'] * t['price']
-                lines.append(
-                    f"  • {t['pair']}: {t['direction']} {t['size']:.6f} @ ${t['price']:,.2f} (${value:,.2f})"
-                )
+        # Risk status with icon
+        if data.drawdown_pct < data.max_drawdown_pct * 0.5:
+            risk_icon = "✅"
+        elif data.drawdown_pct < data.max_drawdown_pct * 0.8:
+            risk_icon = "⚠️"
         else:
-            lines.append("  No trades executed today")
+            risk_icon = "🚨"
         
         lines.extend([
+            f"   {risk_icon} Drawdown: {data.drawdown_pct:.1f}% (limit: {data.max_drawdown_pct:.0f}%)",
+            f"   Status: {data.risk_status}",
             "",
-            "📊 CURRENT POSITIONS",
-            "-" * 30,
+            "🔄 TODAY'S ACTIVITY",
+            f"   Total Trades: {data.trades_total}",
         ])
         
-        if data.positions:
-            for p in data.positions:
-                lines.append(
-                    f"  {p['pair']:8s}: {p['position']:>12.4f} "
-                    f"(${p['value']:>10,.2f}, P&L: ${p['unrealised_pnl']:>+8,.2f})"
-                )
-        else:
-            lines.append("  No open positions")
-        
-        lines.extend([
-            "",
-            "📡 SIGNALS",
-            "-" * 30,
-        ])
-        
-        if data.signals:
-            for sig in data.signals:
-                if sig['signal'] in ['STRONG_BUY', 'BUY']:
-                    icon = "✅"
-                elif sig['signal'] in ['SELL', 'STRONG_SELL']:
-                    icon = "⛔"
-                elif sig['signal'] == 'NO_DATA':
-                    icon = "❓"
+        if data.trades_total > 0:
+            if data.trades_entry > 0:
+                lines.append(f"   New Positions:    {data.trades_entry}")
+            if data.trades_exit > 0:
+                lines.append(f"   Exits:            {data.trades_exit}")
+            if data.trades_rebalance > 0:
+                lines.append(f"   Rebalancing:      {data.trades_rebalance}")
+            lines.append(f"   Total Costs:      ${data.total_costs:,.2f}")
+            
+            # Individual trade details
+            lines.extend([
+                "",
+                "   ─────────────────────────────────────────────",
+                "   TRADE DETAILS",
+                "   ─────────────────────────────────────────────",
+            ])
+            
+            for trade in data.trades:
+                time_str = trade.timestamp.strftime('%H:%M')
+                
+                # Direction icon
+                if trade.direction == 'BUY':
+                    dir_icon = "🟢"
+                    action = "Bought"
                 else:
-                    icon = "⏸️"
+                    dir_icon = "🔴"
+                    action = "Sold"
                 
-                target = sig.get('target_position', 0) or 0
-                hr = sig.get('hit_rate', 0) or 0
+                # Trade type description
+                if trade.trade_type == 'ENTRY':
+                    type_desc = "(New Position)"
+                elif trade.trade_type == 'EXIT':
+                    type_desc = "(Closed)"
+                elif trade.trade_type == 'INCREASE':
+                    type_desc = "(Added)"
+                elif trade.trade_type == 'DECREASE':
+                    type_desc = "(Reduced)"
+                else:
+                    type_desc = ""
                 
                 lines.append(
-                    f"  {icon} {sig['pair']:8s}: {sig['signal']:12s} "
-                    f"(HR: {hr:.1%}, Target: {target:.2f})"
+                    f"   {time_str} {dir_icon} {action} {trade.friendly_name}"
                 )
+                lines.append(
+                    f"         {trade.size:.6f} @ ${trade.price:,.2f} = ${trade.value:,.2f} {type_desc}"
+                )
+            
+            lines.append("   ─────────────────────────────────────────────")
         else:
-            lines.append("  No signal data available")
+            lines.append("   No trades today")
         
         lines.extend([
             "",
-            "=" * 50,
-            "End of Report",
+            "📊 CURRENT HOLDINGS",
+        ])
+        
+        if data.holdings:
+            for h in data.holdings:
+                lines.append(f"   {h['friendly_name']:24s} ${h['value']:>10,.0f} ({h['percentage']:>4.0f}%)")
+            lines.append(f"   {'Cash':24s} ${data.cash:>10,.0f}")
+        else:
+            lines.append("   No positions held")
+            lines.append(f"   {'Cash':24s} ${data.cash:>10,.0f}")
+        
+        lines.extend([
+            "",
             "=" * 50,
         ])
         
         return "\n".join(lines)
     
     def generate_dict(self) -> Dict[str, Any]:
-        """
-        Generate report as dictionary (for JSON/API use).
-        
-        Returns:
-            Dictionary with all report data
-        """
+        """Generate report as dictionary for API/JSON use."""
         data = self.gather_data()
         
         return {
             'timestamp': data.timestamp.isoformat(),
-            'equity': {
+            'portfolio': {
                 'total': data.total_equity,
-                'cash': data.cash,
-                'invested': data.invested,
-                'daily_pnl': data.daily_pnl,
-                'drawdown': data.drawdown,
-                'peak': data.peak_equity,
+                'yesterday': data.yesterday_equity,
+                'daily_change': data.daily_change,
+                'daily_change_pct': data.daily_change_pct,
+            },
+            'performance': {
+                'week': data.week_change,
+                'week_pct': data.week_change_pct,
+                'month': data.month_change,
+                'month_pct': data.month_change_pct,
+                'inception': data.inception_change,
+                'inception_pct': data.inception_change_pct,
             },
             'risk': {
-                'var_95': data.var_95,
-                'var_99': data.var_99,
-                'portfolio_vol': data.portfolio_vol,
-                'max_drawdown': data.max_drawdown,
+                'drawdown_pct': data.drawdown_pct,
+                'max_drawdown_pct': data.max_drawdown_pct,
+                'status': data.risk_status,
             },
-            'positions': data.positions,
-            'signals': data.signals,
-            'trades': data.trades,
+            'activity': {
+                'total_trades': data.trades_total,
+                'entries': data.trades_entry,
+                'exits': data.trades_exit,
+                'rebalancing': data.trades_rebalance,
+                'costs': data.total_costs,
+            },
+            'trades': [
+                {
+                    'timestamp': t.timestamp.isoformat(),
+                    'pair': t.pair,
+                    'friendly_name': t.friendly_name,
+                    'direction': t.direction,
+                    'trade_type': t.trade_type,
+                    'size': t.size,
+                    'price': t.price,
+                    'value': t.value,
+                    'cost': t.cost,
+                }
+                for t in data.trades
+            ],
+            'holdings': data.holdings,
+            'cash': data.cash,
         }

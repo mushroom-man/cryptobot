@@ -1,28 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-CryptoBot Reports Module
-========================
-Standalone reporting system for CryptoBot.
-
-Decoupled from runner.py to enable:
-- Reports independent of trading runs
-- Historical report generation
-- Multiple report types
-- Testable in isolation
+CryptoBot - Reports Module
+==========================
+Partner-friendly reporting for daily and weekly summaries.
 
 Usage:
-    from cryptobot.reports import DailyReport, ReportSender
+    from cryptobot.reports import DailyReport, WeeklyReport, ReportSender
     
-    # Generate report from database
-    report = DailyReport(db, config)
-    content = report.generate()
+    # Generate daily report
+    daily = DailyReport(db, config)
+    content = daily.generate()
     
-    # Send via email/pushover
+    # Generate weekly report
+    weekly = WeeklyReport(db, config)
+    content = weekly.generate()
+    
+    # Send reports
     sender = ReportSender(config)
-    sender.send(content, subject="CryptoBot Daily Report")
+    sender.send_email(content, subject="Daily Report")
 """
 
-from cryptobot.reports.daily_report import DailyReport
-from cryptobot.reports.sender import ReportSender
+from .daily_report import DailyReport
+from .weekly_report import WeeklyReport
+from .sender import ReportSender
+from .pair_names import get_friendly_name, get_short_name
 
-__all__ = ['DailyReport', 'ReportSender']
+__all__ = [
+    'DailyReport',
+    'WeeklyReport', 
+    'ReportSender',
+    'get_friendly_name',
+    'get_short_name',
+]
