@@ -1,98 +1,80 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 CryptoBot - Signals Module
 ===========================
-16-state signal generation with NO_MA72_ONLY filter for directional and pairs trading.
+16-state regime detection, hit rate calculation, and quality filtering.
+
+Shared engine modules (single source of truth for backtest and live):
+
+    regime.py    — RegimeClassifier: bar-by-bar classification with hysteresis
+    features.py  — build_24h_signals(): batch 24h signal generation for training
+    hit_rates.py — HitRateCalculator: expanding-window hit rates per state
+    quality.py   — QualityFilter: dist_ma168 position sizing + dead zone
 
 Validated Configuration:
-    - 16 states (4 trend × 4 MA alignment)
-    - NO_MA72_ONLY filter (56% signal reduction, same alpha)
+    - 16 states (4 binary components: trend_24h, trend_168h, ma72>ma24, ma168>ma24)
+    - NO_MA72_ONLY filter (suppresses MA72-only transitions)
     - MA periods: 24h=16, 72h=6, 168h=2
-    - Buffers: entry=1.5%, exit=0.5%
+    - Hysteresis: entry=1.5%, exit=0.5% (AND logic)
 
 Usage:
-    from cryptobot.signals import SignalGenerator
-    
-    gen = SignalGenerator()
-    signals = gen.generate_signals(df_1h)
-    position, details = gen.get_position_for_date(signals, returns, date, data_start)
+    # Direct submodule imports (preferred):
+    from cryptobot.signals.regime import RegimeClassifier, RegimeConfig
+    from cryptobot.signals.features import build_24h_signals
+    from cryptobot.signals.hit_rates import HitRateCalculator
+    from cryptobot.signals.quality import QualityFilter
+
+    # Or via package:
+    from cryptobot.signals import RegimeClassifier, build_24h_signals
 """
 
-from cryptobot.signals.generator import (
-    # Main class
-    SignalGenerator,
-    
-    # Core functions (16-state)
-    resample_ohlcv,
-    label_trend_binary,
-    generate_16state_signals,
-    calculate_expanding_hit_rates,
-    get_16state_position,
-    
-    # Filter function
-    should_trade_signal,
-    get_state_tuple,
-    
-    # Pairs trading helpers
-    hit_rate_to_simple_state,
-    state_to_numeric,
-    get_state_divergence,
-    
-    # Constants
-    MA_PERIOD_24H,
-    MA_PERIOD_72H,
-    MA_PERIOD_168H,
-    ENTRY_BUFFER,
-    EXIT_BUFFER,
-    HIT_RATE_THRESHOLD,
-    MIN_SAMPLES_PER_STATE,
-    STRONG_BUY_THRESHOLD,
-    BUY_THRESHOLD,
-    SELL_THRESHOLD,
-    USE_MA72_FILTER,
-    
-    # Data structures
-    Signal,
-    FilterStats,
-    
-    # Legacy aliases (deprecated)
-    generate_32state_signals,
-    get_32state_position,
+# =========================================================================
+# Regime classification
+# =========================================================================
+from cryptobot.signals.regime import (
+    RegimeClassifier,
+    RegimeConfig,
+    RegimeState,
 )
 
+# =========================================================================
+# Batch signal generation (24h resolution, for hit rate training)
+# =========================================================================
+from cryptobot.signals.features import (
+    build_24h_signals,
+)
+
+# =========================================================================
+# Hit rate calculation
+# =========================================================================
+from cryptobot.signals.hit_rates import (
+    HitRateCalculator,
+    HitRateConfig,
+)
+
+# =========================================================================
+# Quality filter
+# =========================================================================
+from cryptobot.signals.quality import (
+    QualityFilter,
+    QualityConfig,
+)
+
+
 __all__ = [
-    # Main class
-    'SignalGenerator',
-    
-    # Core functions
-    'resample_ohlcv',
-    'label_trend_binary',
-    'generate_16state_signals',
-    'calculate_expanding_hit_rates',
-    'get_16state_position',
-    
-    # Filter
-    'should_trade_signal',
-    'get_state_tuple',
-    
-    # Pairs helpers
-    'hit_rate_to_simple_state',
-    'state_to_numeric',
-    'get_state_divergence',
-    
-    # Data structures
-    'Signal',
-    'FilterStats',
-    
-    # Constants
-    'MA_PERIOD_24H',
-    'MA_PERIOD_72H', 
-    'MA_PERIOD_168H',
-    'ENTRY_BUFFER',
-    'EXIT_BUFFER',
-    'USE_MA72_FILTER',
-    
-    # Legacy (deprecated)
-    'generate_32state_signals',
-    'get_32state_position',
+    # Regime
+    'RegimeClassifier',
+    'RegimeConfig',
+    'RegimeState',
+
+    # Features
+    'build_24h_signals',
+
+    # Hit rates
+    'HitRateCalculator',
+    'HitRateConfig',
+
+    # Quality
+    'QualityFilter',
+    'QualityConfig',
 ]

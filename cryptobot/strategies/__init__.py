@@ -1,23 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-CryptoBot - Strategies Package
+CryptoBot - Strategies Module
 ===============================
-Trading strategies implementing the Predictor protocol.
+Trading strategy implementations.
 
-Available Strategies:
-    - MomentumStrategy: Validated 16-state momentum (default)
+Primary strategy:
+    MomentumStrategy — 16-state regime momentum with dynamic hit-rate
+    signals, boost logic, quality filter, and long/short support.
 
 Usage:
-    from cryptobot.strategies import MomentumStrategy
-    
+    from cryptobot.strategies import MomentumStrategy, MomentumConfig, SignalResult
+
     strategy = MomentumStrategy()
-    multiplier = strategy.predict(features)
+    strategy.init_hit_rates(pair, signals_24h, returns_24h, current_date)
+    result = strategy.predict(features)
+    # result.multiplier: signed position scalar
+    # result.signal_type: LONG / SHORT / BOOSTED_LONG / FLAT
 """
 
-from .momentum import MomentumStrategy, MomentumConfig, PairState
+from cryptobot.strategies.momentum import (
+    MomentumStrategy,
+    MomentumConfig,
+    SignalResult,
+)
 
 __all__ = [
     'MomentumStrategy',
     'MomentumConfig',
-    'PairState',
+    'SignalResult',
 ]

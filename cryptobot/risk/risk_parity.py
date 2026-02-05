@@ -30,7 +30,7 @@ Usage:
     for pair in pairs:
         position = sizer.calculate_position(
             pair=pair,
-            signal=signal_position,  # 0.0 to 1.0
+            signal=signal_position,  # signed: +1.0 long, -0.5 short, 0.0 flat
             weight=weights[pair],
             equity=equity,
             peak_equity=peak_equity,
@@ -373,17 +373,20 @@ class RiskParitySizer(BasePortfolioSizer):
         Calculate target position for a single asset.
         
         Combines:
-            - Signal strength (0.0 to 1.0)
+            - Signal strength (signed: +1.0 long, -0.5 short, 0.0 flat)
             - Risk parity weight
             - Volatility scaling
             - Drawdown protection
             - Max exposure limit
         
+        Accepts signed signals: positive = long, negative = short.
+        Sizing uses abs(signal), sign is preserved on the output position.
+        
         From validated backtest lines 572-597.
         
         Args:
             pair: Trading pair
-            signal: Signal strength (0.0 = no position, 1.0 = full position)
+            signal: Signed signal (-1.0 to +1.5). 0.0 = no position.
             weight: Portfolio weight for this pair
             equity: Current portfolio equity
             peak_equity: Peak portfolio equity
@@ -392,10 +395,14 @@ class RiskParitySizer(BasePortfolioSizer):
             price: Current price of the asset
         
         Returns:
-            Target position in units (e.g., number of coins)
+            Target position in units (signed: positive=long, negative=short)
         """
-        if signal <= 0 or price <= 0 or equity <= 0:
+        if signal == 0.0 or price <= 0 or equity <= 0:
             return 0.0
+        
+        # Separate direction from magnitude
+        direction = 1.0 if signal > 0 else -1.0
+        magnitude = abs(signal)
         
         # Calculate scalars
         vol_scalar = self.calculate_vol_scalar(returns_df, current_date)
@@ -407,8 +414,8 @@ class RiskParitySizer(BasePortfolioSizer):
         risk_scalar = max(risk_scalar, self.config.min_exposure_floor)
         
         # Calculate exposure for this pair
-        # exposure = signal × weight × risk_scalar
-        exposure = signal * weight * risk_scalar
+        # exposure = magnitude × weight × risk_scalar
+        exposure = magnitude * weight * risk_scalar
         
         # Apply max exposure (across portfolio, but limit individual too)
         # Individual pair shouldn't exceed weight × max_exposure
@@ -420,7 +427,8 @@ class RiskParitySizer(BasePortfolioSizer):
         allocation = equity * exposure
         position = allocation / price
         
-        return position
+        # Apply direction (negative for shorts)
+        return direction * position
     
     def calculate_all_positions(
         self,
@@ -438,7 +446,7 @@ class RiskParitySizer(BasePortfolioSizer):
         ensures total exposure doesn't exceed max_exposure.
         
         Args:
-            signals: Dict mapping pair -> signal strength (0.0 to 1.0)
+            signals: Dict mapping pair -> signed signal (-1.0 to +1.5, 0.0 = flat)
             equity: Current portfolio equity
             peak_equity: Peak portfolio equity
             returns_df: DataFrame of asset returns
@@ -446,7 +454,7 @@ class RiskParitySizer(BasePortfolioSizer):
             prices: Dict mapping pair -> current price
         
         Returns:
-            Dict mapping pair -> target position in units
+            Dict mapping pair -> target position in units (signed)
         """
         # Normalize inputs once
         current_date = normalize_timestamp(current_date)
