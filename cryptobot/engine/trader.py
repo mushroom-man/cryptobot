@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
 CryptoBot - Live/Paper Trading Runner
 ======================================
@@ -8,16 +9,20 @@ FILE: apps/live/trader.py
 Trading runner using pluggable Strategy + Executor pattern.
 
 Strategies:
-    - momentum: Validated 16-state momentum (2.5% buffer, 3h confirm, S12/14 exclusion)
+    - momentum: Validated 16-state momentum with dynamic hit-rate
+      L/S signals, quality filter, and NO_MA72_ONLY transition filter.
 
 Execution Modes:
     - paper: Simulated execution with slippage
     - live: Real execution via Kraken API
 
-Validated Performance (momentum strategy):
-    - Annual Return: +58.6%
-    - Sharpe Ratio: 3.04
-    - Max Drawdown: -12.2%
+Signal Flow:
+    1. build_24h_signals() generates historical signals/returns per pair
+    2. HitRateCalculator bootstraps expanding-window hit rates
+    3. Hourly: predict() -> SignalResult (LONG / SHORT / BOOSTED_LONG / FLAT)
+    4. Risk Parity sizes signed positions (positive=long, negative=short)
+    5. Dead zone filter suppresses micro-rebalances
+    6. Executor places orders
 
 Usage:
     python -m apps.live.trader --strategy momentum --mode paper
@@ -28,10 +33,9 @@ Usage:
 Scheduling:
     --hourly flag: Update data first, then run trading logic.
     
-    The 3h confirmation filter is inside MomentumStrategy. To catch signals
-    when they confirm, trading logic MUST run every hour. The strategy
-    internally tracks state persistence and only triggers trades when
-    confirmation completes.
+    The strategy runs every hour to detect regime transitions promptly.
+    Hit rates recalculate monthly (expanding window). The hourly loop
+    is lightweight: one classify_bar() + cached hit rate lookup per pair.
     
     Cron example (run every hour):
         0 * * * * cd ~/cryptobot && python -m apps.live.trader --strategy momentum --mode paper --hourly
@@ -59,10 +63,14 @@ from cryptobot.data.database import Database
 from cryptobot.data.kraken import KrakenAPI
 from cryptobot.risk.risk_parity import RiskParitySizer, RiskParityConfig
 from cryptobot.risk.var import calculate_var
-from cryptobot.reports import DailyReport, ReportSender
+from cryptobot.reports import DailyReport, WeeklyReport, ReportSender
+from cryptobot.reports.posture import build_posture_data, get_posture_messages, format_posture_block
+from cryptobot.reports.weekly_posture import generate_weekly_posture
 
 # Strategy and Executor imports
 from cryptobot.strategies import MomentumStrategy
+from cryptobot.signals.features import build_24h_signals
+from cryptobot.signals.regime import RegimeConfig
 from cryptobot.executors import PaperExecutor, LiveExecutor
 from cryptobot.types.bar import Bar
 from cryptobot.types.order import Order
@@ -212,8 +220,11 @@ def build_returns_df(db: Database, pairs: List[str], lookback_days: int = 90) ->
         try:
             df = db.get_ohlcv(pair, start=start_date)
             if df is not None and len(df) > 0:
-                daily = df['close'].resample('24h').last().ffill()
-                returns = daily.pct_change().dropna()
+                daily = df.resample('24h').agg({
+                    'open': 'first', 'high': 'max', 'low': 'min',
+                    'close': 'last', 'volume': 'sum'
+                }).dropna()
+                returns = daily['close'].pct_change().dropna()
                 returns_data[pair] = returns
         except Exception as e:
             logging.getLogger('trader').warning(f"Could not load returns for {pair}: {e}")
@@ -278,7 +289,7 @@ class TradingRunner:
         # Initialize strategy
         if strategy_name == 'momentum':
             self.strategy = MomentumStrategy()
-            self.logger.info(f"Strategy: MomentumStrategy (validated 16-state)")
+            self.logger.info(f"Strategy: MomentumStrategy (16-state, dynamic L/S)")
         else:
             raise ValueError(f"Unknown strategy: {strategy_name}")
         
@@ -336,6 +347,22 @@ class TradingRunner:
         loaded = self.strategy.load_state_for_pairs(self.db, self.pairs)
         self.logger.info(f"Loaded strategy state for {loaded} pairs")
         
+        # Bootstrap hit rates (expanding window over all available history)
+        self.logger.info("-" * 40)
+        self.logger.info("Initializing hit rates...")
+        current_date = pd.Timestamp(run_time).tz_localize(None)
+        for pair in self.pairs:
+            try:
+                df_1h_full = self.db.get_ohlcv(pair)  # All available history
+                if df_1h_full is not None and len(df_1h_full) > 500:
+                    signals_24h, returns_24h = build_24h_signals(df_1h_full)
+                    self.strategy.init_hit_rates(pair, signals_24h, returns_24h, current_date)
+                    self.logger.info(f"  {pair}: hit rates initialized ({len(signals_24h)} bars)")
+                else:
+                    self.logger.warning(f"  {pair}: insufficient history for hit rates")
+            except Exception as e:
+                self.logger.error(f"  {pair}: hit rate init failed - {e}")
+        
         # Get current equity (or initialize)
         equity = self._get_or_init_equity(run_time)
         self.logger.info(f"Current equity: ${equity['total_equity']:,.2f}")
@@ -352,7 +379,6 @@ class TradingRunner:
             self.logger.info(f"Returns data: {len(returns_df)} days, {len(returns_df.columns)} pairs")
         
         # Calculate Risk Parity weights
-        current_date = pd.Timestamp(run_time)
         self.risk_parity_weights = self.sizer.calculate_weights(returns_df, current_date)
         
         if not self.dry_run:
@@ -364,9 +390,17 @@ class TradingRunner:
             self.logger.info(f"  {pair}: {weight:.1%}")
         
         # Log sizer scalars
-        vol_scalar = self.sizer.calculate_vol_scalar(returns_df, current_date)
-        dd_scalar = self.sizer.calculate_dd_scalar(equity['total_equity'], equity['peak_equity'])
-        self.logger.info(f"Vol scalar: {vol_scalar:.2f}, DD scalar: {dd_scalar:.2f}")
+        self.vol_scalar = self.sizer.calculate_vol_scalar(returns_df, current_date)
+        self.dd_scalar = self.sizer.calculate_dd_scalar(equity['total_equity'], equity['peak_equity'])
+        self.logger.info(f"Vol scalar: {self.vol_scalar:.2f}, DD scalar: {self.dd_scalar:.2f}")
+        
+        # Track previous positions for posture reporting
+        positions_before = self.db.get_current_positions()
+        self.previous_position_count = 0
+        if positions_before is not None:
+            for _, _p in positions_before.iterrows():
+                if _p['position'] and abs(_p['position']) > 0.0001:
+                    self.previous_position_count += 1
         
         # Collect signals and prices for all pairs first
         pair_data = {}
@@ -407,14 +441,23 @@ class TradingRunner:
                 signal_type=data['signal_type'],
                 state=data['state'],
                 duration=data['duration'],
+                hit_rate=data.get('hit_rate', 0.5),
+                quality_scalar=data.get('quality_scalar', 0.0),
                 equity=equity,
                 run_time=run_time
             )
         
         
+        # Mark-to-market equity update (every run, not just when trades execute)
+        self._update_equity(equity, run_time)
+        
         # Summary
         summary = self._generate_summary()
         self._log_summary(summary)
+        
+        # Send trade alert email if trades were executed
+        if self.trades_executed and not self.dry_run:
+            self._send_trade_alert(summary)
         
         # Save strategy state for next run
         if not self.dry_run:
@@ -448,6 +491,9 @@ class TradingRunner:
         """
         Get signal data for a single pair using the strategy.
         
+        Calls MomentumStrategy.predict() which returns a SignalResult
+        with signed multiplier, state info, hit rate, and quality scalar.
+        
         Returns:
             Dict with signal info, or None if insufficient data
         """
@@ -461,15 +507,18 @@ class TradingRunner:
         
         self.logger.info(f"{pair}: Loaded {len(df_1h)} hourly bars")
         
-        # 2. Compute MAs for strategy
-        # Resample to get multi-timeframe MAs
-        df_24h = df_1h['close'].resample('24h').last().ffill()
-        df_72h = df_1h['close'].resample('72h').last().ffill()
-        df_168h = df_1h['close'].resample('168h').last().ffill()
+        # 2. Compute MAs for strategy (latest bar values)
+        # Must use proper OHLCV agg + dropna to match backtest exactly.
+        # resample().last().ffill() fills empty periods, changing rolling MA values.
+        _agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+        df_24h = df_1h.resample('24h').agg(_agg).dropna()
+        df_72h = df_1h.resample('72h').agg(_agg).dropna()
+        df_168h = df_1h.resample('168h').agg(_agg).dropna()
         
-        ma_24h = df_24h.rolling(16).mean().iloc[-1]
-        ma_72h = df_72h.rolling(6).mean().iloc[-1]
-        ma_168h = df_168h.rolling(2).mean().iloc[-1]
+        cfg = self.strategy.classifier.config
+        ma_24h = df_24h['close'].rolling(cfg.ma_period_24h).mean().iloc[-1]
+        ma_72h = df_72h['close'].rolling(cfg.ma_period_72h).mean().iloc[-1]
+        ma_168h = df_168h['close'].rolling(cfg.ma_period_168h).mean().iloc[-1]
         current_price = df_1h['close'].iloc[-1]
         
         # 3. Get signal from strategy
@@ -481,46 +530,32 @@ class TradingRunner:
             'ma_168h': ma_168h,
         }
         
-        position_multiplier = self.strategy.predict(features)
+        result = self.strategy.predict(features)
         
-        # Get state info for logging
-        pair_state = self.strategy.get_pair_state(pair)
-        state_num = pair_state.confirmed_state if pair_state else 0
-        duration = pair_state.duration_hours if pair_state else 0
-        
-        # Map multiplier to signal type
-        if position_multiplier == 0:
-            if pair_state and pair_state.confirmed_state in {12, 14}:
-                signal_type = "EXCLUDED"
-            elif pair_state and pair_state.confirmed_state < 8:
-                signal_type = "BEARISH"
-            else:
-                signal_type = "FLAT"
-        elif position_multiplier == 1.5:
-            signal_type = "BOOSTED_LONG"
-        else:
-            signal_type = "LONG"
-        
-        # Determine action description
-        if position_multiplier == 1.5:
-            action = "🚀 BOOSTED LONG (150%)"
-        elif position_multiplier == 1.0:
-            action = "✅ LONG (100%)"
-        elif pair_state and pair_state.confirmed_state in {12, 14}:
-            action = "⛔ EXCLUDED (exhaustion state)"
-        else:
-            action = "⏸️ FLAT (bearish)"
+        # 4. Log action
+        action_map = {
+            'BOOSTED_LONG': '🚀 BOOSTED LONG (150%)',
+            'LONG':         '✅ LONG (100%)',
+            'SHORT':        '🔻 SHORT',
+            'FLAT':         '⏸️ FLAT',
+        }
+        action = action_map.get(result.signal_type, f'❓ {result.signal_type}')
         
         self.logger.info(
-            f"{pair}: {action} | State={state_num}, Duration={duration}h"
+            f"{pair}: {action} | State={result.state_int}, "
+            f"Duration={result.duration_hours}h, "
+            f"HR={result.hit_rate:.0%}(n={result.hit_rate_n}), "
+            f"Quality={result.quality_scalar:.2f}"
         )
         
         return {
-            'signal_position': position_multiplier,
-            'signal_type': signal_type,
+            'signal_position': result.multiplier,
+            'signal_type': result.signal_type,
             'price': current_price,
-            'state': state_num,
-            'duration': duration,
+            'state': result.state_int,
+            'duration': result.duration_hours,
+            'hit_rate': result.hit_rate,
+            'quality_scalar': result.quality_scalar,
         }
     
     def _process_pair_trade(
@@ -531,6 +566,8 @@ class TradingRunner:
         signal_type: str,
         state: int,
         duration: int,
+        hit_rate: float,
+        quality_scalar: float,
         equity: dict,
         run_time: datetime,
     ):
@@ -543,9 +580,9 @@ class TradingRunner:
                 strategy=self.strategy_name,
                 signal=signal_type,
                 target_position=target_position,
-                confidence=0.55 if target_position > 0 else 0.45,
+                confidence=hit_rate,
                 regime=state,
-                prediction=0.55 if target_position > 0 else 0.45,
+                prediction=hit_rate,
                 timestamp=run_time
             )
         
@@ -556,11 +593,17 @@ class TradingRunner:
             'duration': duration,
             'target_position': target_position,
             'weight': self.risk_parity_weights.get(pair, 0),
+            'quality_scalar': quality_scalar,
         })
         
         # Get current position
         current_pos = self.db.get_position(pair)
         current_position = current_pos['position'] if current_pos else 0.0
+        
+        # Dead zone filter: suppress micro-rebalances
+        if not self.strategy.quality.should_rebalance(target_position, current_position):
+            self.logger.info(f"{pair}: Rebalance suppressed by dead zone filter")
+            return
         
         # Check if trade needed
         position_diff = target_position - current_position
@@ -629,9 +672,11 @@ class TradingRunner:
         # Execute via executor (paper or live - same interface!)
         fill = self.executor.execute(order, bar)
         
+        # Classify trade type
+        trade_type = classify_trade(current_position, target_position)
+        
         # Record to database
         if not self.dry_run:
-            trade_type = classify_trade(current_position, target_position)
             self.db.record_trade(
                 pair=pair,
                 strategy=self.strategy_name,
@@ -648,6 +693,7 @@ class TradingRunner:
         self.trades_executed.append({
             'pair': pair,
             'direction': order.side.value.upper(),
+            'trade_type': trade_type,
             'size': fill.fill_size,
             'price': fill.fill_price,
             'value': fill.notional_value,
@@ -657,7 +703,12 @@ class TradingRunner:
         })
     
     def _update_equity(self, equity: dict, run_time: datetime):
-        """Update equity snapshot after all trades."""
+        """Update equity snapshot after all trades.
+        
+        For longs: invested value is an asset (positive)
+        For shorts: market value is a liability (negative)
+        Total equity = cash + long_value - short_liability
+        """
         
         if self.dry_run:
             return
@@ -665,17 +716,22 @@ class TradingRunner:
         # Get all current positions
         positions_df = self.db.get_current_positions()
         
-        # Calculate invested value
+        # Calculate invested value (longs positive, shorts negative)
         invested = 0.0
         
         if positions_df is not None and len(positions_df) > 0:
             for _, row in positions_df.iterrows():
-                if row['position'] and row['position'] != 0:
-                    live_price = self.db.get_latest_price(row['pair'])
-                    if live_price:
-                        invested += abs(row['position'] * live_price)
-                    elif row['current_price']:
-                        invested += abs(row['position'] * row['current_price'])
+                position = row['position'] or 0
+                if position == 0:
+                    continue
+                
+                live_price = self.db.get_latest_price(row['pair'])
+                if live_price is None:
+                    live_price = row.get('current_price', 0) or 0
+                
+                # position is negative for shorts, positive for longs
+                # This naturally gives: longs add value, shorts subtract value
+                invested += position * live_price
         
         # Calculate cash change from today's trades
         cash_change = 0.0
@@ -712,6 +768,33 @@ class TradingRunner:
     
     def _generate_summary(self) -> dict:
         """Generate run summary."""
+        # Detect transitions: duration == 1 means state just changed
+        transition_pairs = [
+            sig['pair'] for sig in self.signals_generated
+            if sig.get('duration', 0) == 1
+        ]
+        
+        # Get latest equity for posture
+        equity = self.db.get_latest_equity() or {
+            'total_equity': self.initial_capital,
+            'peak_equity': self.initial_capital,
+            'drawdown': 0.0,
+        }
+        
+        # Build posture data
+        posture_data = build_posture_data(
+            signals=self.signals_generated,
+            trades_executed=self.trades_executed,
+            vol_scalar=self.vol_scalar,
+            dd_scalar=self.dd_scalar,
+            equity=equity,
+            initial_capital=self.initial_capital,
+            previous_position_count=self.previous_position_count,
+            max_drawdown_pct=self.config['risk']['max_drawdown'] * 100,
+            transition_pairs=transition_pairs,
+        )
+        posture_messages = get_posture_messages(posture_data)
+        
         return {
             'run_time': datetime.now(timezone.utc).isoformat(),
             'strategy': self.strategy_name,
@@ -727,8 +810,106 @@ class TradingRunner:
             'risk_parity_weights': self.risk_parity_weights.copy(),
             'sizer_stats': self.sizer.get_stats(),
             'active_boosts': self.strategy.get_active_boosts() if hasattr(self.strategy, 'get_active_boosts') else [],
-            'excluded_pairs': self.strategy.get_excluded_pairs() if hasattr(self.strategy, 'get_excluded_pairs') else [],
+            'short_pairs': self.strategy.get_short_pairs() if hasattr(self.strategy, 'get_short_pairs') else [],
+            'posture_messages': posture_messages,
+            'transition_pairs': transition_pairs,
         }
+    
+    def _send_trade_alert(self, summary: dict):
+        """
+        Send trade alert email when trades are executed.
+        
+        Only called when trades_executed is non-empty and not dry_run.
+        """
+        if not self.config.get('notifications', {}).get('enabled'):
+            return
+        
+        now_melb = melbourne_now()
+        
+        lines = [
+            f"CRYPTOBOT TRADE ALERT - {now_melb.strftime('%Y-%m-%d %H:%M')} Melbourne",
+            "=" * 50,
+            "",
+        ]
+        
+        for t in self.trades_executed:
+            direction = t['direction']
+            trade_type = t.get('trade_type', 'ENTRY')
+            
+            # Determine action label from direction + trade_type
+            # BUY-side actions = 🟢, SELL-side actions = 🔴
+            if direction == 'BUY' and trade_type == 'ENTRY':
+                direction_icon = "\U0001f7e2"
+                action = "Bought"
+            elif direction == 'BUY' and trade_type == 'EXIT':
+                direction_icon = "\U0001f7e2"
+                action = "Covered"  # Closing a short
+            elif direction == 'BUY' and trade_type == 'INCREASE':
+                direction_icon = "\U0001f7e2"
+                action = "Added to long"
+            elif direction == 'BUY' and trade_type == 'DECREASE':
+                direction_icon = "\U0001f7e2"
+                action = "Reduced short"
+            elif direction == 'SELL' and trade_type == 'ENTRY':
+                direction_icon = "\U0001f534"
+                action = "Shorted"
+            elif direction == 'SELL' and trade_type == 'EXIT':
+                direction_icon = "\U0001f534"
+                action = "Sold"  # Closing a long
+            elif direction == 'SELL' and trade_type == 'INCREASE':
+                direction_icon = "\U0001f534"
+                action = "Added to short"
+            elif direction == 'SELL' and trade_type == 'DECREASE':
+                direction_icon = "\U0001f534"
+                action = "Reduced long"
+            else:
+                direction_icon = "\U0001f534" if direction == 'SELL' else "\U0001f7e2"
+                action = direction.title()
+            
+            # Find matching signal for state/hit_rate info
+            sig = next(
+                (s for s in self.signals_generated if s['pair'] == t['pair']),
+                None
+            )
+            sig_info = ""
+            if sig:
+                sig_info = f"  (S{sig['state']}, HR: {sig.get('quality_scalar', 0):.0%})"
+            
+            lines.append(f"{direction_icon} {action} {t['pair']}")
+            lines.append(
+                f"   {t['size']:.6f} @ ${t['price']:,.2f} = "
+                f"${t['value']:,.2f}{sig_info}"
+            )
+            lines.append("")
+        
+        lines.extend([
+            "-" * 50,
+            f"Total Deployed:  ${summary['total_trade_value']:>12,.2f}",
+            f"Trading Costs:   ${summary['total_trading_costs']:>12,.2f}",
+            f"Slippage:        ${summary['total_slippage']:>12,.2f}",
+            "",
+        ])
+        
+        # Append posture messages
+        if summary.get('posture_messages'):
+            lines.append("STRATEGY POSTURE")
+            lines.append("-" * 50)
+            for msg in summary['posture_messages']:
+                lines.append(msg)
+                lines.append("")
+        
+        lines.append("=" * 50)
+        
+        content = "\n".join(lines)
+        n_trades = summary['trades_executed']
+        subject = f"CryptoBot: {n_trades} trade{'s' if n_trades != 1 else ''} executed"
+        
+        try:
+            sender = ReportSender(self.config)
+            sender.send_email(content, subject=subject)
+            self.logger.info(f"Trade alert sent: {subject}")
+        except Exception as e:
+            self.logger.error(f"Failed to send trade alert: {e}")
     
     def _log_summary(self, summary: dict):
         """Log run summary."""
@@ -810,8 +991,8 @@ class TradingRunner:
                     status = "🚀"
                 elif sig['signal'] == 'LONG':
                     status = "✅"
-                elif sig['signal'] == 'EXCLUDED':
-                    status = "⛔"
+                elif sig['signal'] == 'SHORT':
+                    status = "🔻"
                 else:
                     status = "⏸️"
                 self.logger.info(
@@ -824,15 +1005,22 @@ class TradingRunner:
             self.logger.info("-" * 40)
             self.logger.info(f"🚀 ACTIVE BOOSTS: {', '.join(summary['active_boosts'])}")
         
-        if summary.get('excluded_pairs'):
+        if summary.get('short_pairs'):
             self.logger.info("-" * 40)
-            self.logger.info(f"⛔ EXCLUDED (S12/14): {', '.join(summary['excluded_pairs'])}")
+            self.logger.info(f"🔻 SHORT POSITIONS: {', '.join(summary['short_pairs'])}")
         
         # RISK PARITY WEIGHTS
         self.logger.info("-" * 40)
         self.logger.info("RISK PARITY WEIGHTS:")
         for pair, weight in self.risk_parity_weights.items():
             self.logger.info(f"  {pair:8s}: {weight:>6.1%}")
+        
+        # STRATEGY POSTURE
+        if summary.get('posture_messages'):
+            self.logger.info("-" * 40)
+            self.logger.info("STRATEGY POSTURE:")
+            for msg in summary['posture_messages']:
+                self.logger.info(f"  {msg}")
 
 
 # =============================================================================
@@ -911,8 +1099,7 @@ def main():
             update_data(config, logger)
         
         # STEP 2: Always run trading logic
-        # The 3h confirmation is inside MomentumStrategy - we must check every hour
-        # to catch when confirmation triggers
+        # The strategy runs every hour to detect regime transitions promptly
         logger.info("-" * 40)
         logger.info("RUNNING TRADING LOGIC...")
         logger.info("-" * 40)
@@ -928,15 +1115,45 @@ def main():
         # STEP 3: Send daily report at specified hour only
         if args.hourly and current_hour_melbourne == args.report_hour:
             if config.get('notifications', {}).get('enabled'):
+                sender = ReportSender(config)
+                
+                # --- Daily Report with Posture ---
                 logger.info("-" * 40)
                 logger.info(f"SENDING DAILY REPORT (hour={args.report_hour})")
                 logger.info("-" * 40)
+                
                 report = DailyReport(runner.db, config)
-                sender = ReportSender(config)
-                sender.send_all(
-                    report.generate(),
-                    subject=f"CryptoBot {args.strategy.title()} Report - {melbourne_now().strftime('%Y-%m-%d')}"
+                daily_content = report.generate(
+                    posture_messages=summary.get('posture_messages')
                 )
+                
+                sender.send_email(
+                    daily_content,
+                    subject=f"CryptoBot Daily Report - {melbourne_now().strftime('%Y-%m-%d')}"
+                )
+                
+                # --- Weekly Report on Mondays ---
+                if melbourne_now().weekday() == 0:  # Monday
+                    logger.info("-" * 40)
+                    logger.info("SENDING WEEKLY REPORT (Monday)")
+                    logger.info("-" * 40)
+                    
+                    # Generate weekly posture block
+                    weekly_posture_block = None
+                    try:
+                        weekly_posture_block = generate_weekly_posture(runner.db, config)
+                    except Exception as e:
+                        logger.error(f"Weekly posture generation failed: {e}")
+                    
+                    weekly_report = WeeklyReport(runner.db, config)
+                    weekly_content = weekly_report.generate(
+                        posture_block=weekly_posture_block
+                    )
+                    
+                    sender.send_email(
+                        weekly_content,
+                        subject=f"CryptoBot Weekly Report - {melbourne_now().strftime('%Y-%m-%d')}"
+                    )
         
         logger.info("=" * 60)
         logger.info("Runner completed successfully")

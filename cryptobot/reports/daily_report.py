@@ -356,12 +356,17 @@ class DailyReport:
         
         return summary, trade_details
     
-    def generate(self) -> str:
-        """Generate the formatted daily report."""
+    def generate(self, posture_messages: list = None) -> str:
+        """Generate the formatted daily report.
+        
+        Args:
+            posture_messages: Optional list of posture template strings
+                from posture.get_posture_messages()
+        """
         data = self.gather_data()
-        return self._format_report(data)
+        return self._format_report(data, posture_messages=posture_messages)
     
-    def _format_report(self, data: DailyReportData) -> str:
+    def _format_report(self, data: DailyReportData, posture_messages: list = None) -> str:
         """Format report data into partner-friendly string."""
         
         # Day name for header
@@ -398,6 +403,16 @@ class DailyReport:
             f"   {risk_icon} Drawdown: {data.drawdown_pct:.1f}% (limit: {data.max_drawdown_pct:.0f}%)",
             f"   Status: {data.risk_status}",
             "",
+        ])
+        
+        # Strategy posture (if provided)
+        if posture_messages:
+            lines.append("🧭 STRATEGY POSTURE")
+            for msg in posture_messages:
+                lines.append(f"   {msg}")
+                lines.append("")
+        
+        lines.extend([
             "🔄 TODAY'S ACTIVITY",
             f"   Total Trades: {data.trades_total}",
         ])
@@ -422,13 +437,35 @@ class DailyReport:
             for trade in data.trades:
                 time_str = trade.timestamp.strftime('%H:%M')
                 
-                # Direction icon
-                if trade.direction == 'BUY':
+                # Direction + trade type label
+                # BUY-side actions = 🟢, SELL-side actions = 🔴
+                if trade.direction == 'BUY' and trade.trade_type == 'ENTRY':
                     dir_icon = "🟢"
                     action = "Bought"
-                else:
+                elif trade.direction == 'BUY' and trade.trade_type == 'EXIT':
+                    dir_icon = "🟢"
+                    action = "Covered"
+                elif trade.direction == 'BUY' and trade.trade_type == 'INCREASE':
+                    dir_icon = "🟢"
+                    action = "Added to long"
+                elif trade.direction == 'BUY' and trade.trade_type == 'DECREASE':
+                    dir_icon = "🟢"
+                    action = "Reduced short"
+                elif trade.direction == 'SELL' and trade.trade_type == 'ENTRY':
+                    dir_icon = "🔴"
+                    action = "Shorted"
+                elif trade.direction == 'SELL' and trade.trade_type == 'EXIT':
                     dir_icon = "🔴"
                     action = "Sold"
+                elif trade.direction == 'SELL' and trade.trade_type == 'INCREASE':
+                    dir_icon = "🔴"
+                    action = "Added to short"
+                elif trade.direction == 'SELL' and trade.trade_type == 'DECREASE':
+                    dir_icon = "🔴"
+                    action = "Reduced long"
+                else:
+                    dir_icon = "🔴" if trade.direction == 'SELL' else "🟢"
+                    action = "Bought" if trade.direction == 'BUY' else "Sold"
                 
                 # Trade type description
                 if trade.trade_type == 'ENTRY':

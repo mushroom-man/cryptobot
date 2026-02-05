@@ -330,12 +330,17 @@ class WeeklyReport:
         
         return holdings, cash
     
-    def generate(self) -> str:
-        """Generate the formatted weekly report."""
+    def generate(self, posture_block: str = None) -> str:
+        """Generate the formatted weekly report.
+        
+        Args:
+            posture_block: Optional pre-formatted weekly posture text
+                from weekly_posture.generate_weekly_posture()
+        """
         data = self.gather_data()
-        return self._format_report(data)
+        return self._format_report(data, posture_block=posture_block)
     
-    def _format_report(self, data: WeeklyReportData) -> str:
+    def _format_report(self, data: WeeklyReportData, posture_block: str = None) -> str:
         """Format report data into partner-friendly string."""
         
         week_label = f"{data.week_start.strftime('%d %b')} - {data.week_end.strftime('%d %b %Y')}"
@@ -404,6 +409,13 @@ class WeeklyReport:
             lines.append(f"   {'Cash':24s} ${data.cash_end:>10,.0f} ({cash_pct:>4.0f}%)")
         else:
             lines.append(f"   {'Cash':24s} ${data.cash_end:>10,.0f}")
+        
+        # Weekly posture (context panel + templates)
+        if posture_block:
+            lines.extend([
+                "",
+                posture_block,
+            ])
         
         lines.extend([
             "",
