@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CryptoBot — Historical Signal & Return Builder
+CryptoBot Historical Signal & Return Builder
 ===============================================
 Batch generation of 24h-resolution signals and returns for hit rate
 training.  Both trader.py and backtest import this to build the
@@ -13,7 +13,7 @@ the validated backtest methodology (generate_signals_24h, lines 416-459
 of backtest_long_short_full_analystics_03.py):
 
   * trend_168h is computed on native 168h bars, then forward-filled
-    to 24h — it can only change every 168 hours.
+    to 24h â€” it can only change every 168 hours.
   * trend_24h is computed on native 24h bars.
   * All components are shift(1) to prevent look-ahead bias.
 
@@ -31,6 +31,10 @@ Usage:
 
     # Feed to HitRateCalculator
     calculator.update(pair, signals_24h, returns_24h, current_date)
+
+    # Monthly trend for live trading (added v05)
+    from cryptobot.signals.features import get_current_monthly_trend
+    monthly_trend = get_current_monthly_trend(df_1h)  # 1=bullish, 0=bearish
 """
 
 from typing import Tuple
@@ -75,15 +79,15 @@ def _label_trend_binary(
     hysteresis buffers.
 
     Matches backtest v03 label_trend_binary_rolling (lines 321-347).
-    Uses the SAME buffer values as regime.py's classify_bar — both
+    Uses the SAME buffer values as regime.py's classify_bar â€” both
     read from RegimeConfig.
 
     AND-logic (locked):
-        Bull → Bear: price < MA * (1 - exit_buffer) AND price < MA * (1 - entry_buffer)
-        Bear → Bull: price > MA * (1 + exit_buffer) AND price > MA * (1 + entry_buffer)
+        Bull â†’ Bear: price < MA * (1 - exit_buffer) AND price < MA * (1 - entry_buffer)
+        Bear â†’ Bull: price > MA * (1 + exit_buffer) AND price > MA * (1 + entry_buffer)
 
     Since entry_buffer (1.5%) > exit_buffer (0.5%), the AND collapses
-    to ±entry_buffer symmetric thresholds.
+    to Â±entry_buffer symmetric thresholds.
     """
     labels = pd.Series(index=close.index, dtype=float)
     labels[:] = np.nan
@@ -99,12 +103,12 @@ def _label_trend_binary(
             continue
 
         if current == 1:
-            # Bull → Bear: price must be below BOTH thresholds
+            # Bull â†’ Bear: price must be below BOTH thresholds
             if (price < ma_val * (1 - exit_buffer)
                     and price < ma_val * (1 - entry_buffer)):
                 current = 0
         else:
-            # Bear → Bull: price must be above BOTH thresholds
+            # Bear â†’ Bull: price must be above BOTH thresholds
             if (price > ma_val * (1 + exit_buffer)
                     and price > ma_val * (1 + entry_buffer)):
                 current = 1
@@ -164,13 +168,13 @@ def build_24h_signals(
     # ------------------------------------------------------------------
     # 3. Trend components with hysteresis
     # ------------------------------------------------------------------
-    # trend_24h: 24h close vs 24h MA — computed on native 24h bars
+    # trend_24h: 24h close vs 24h MA â€” computed on native 24h bars
     trend_24h = _label_trend_binary(
         df_24h['close'], ma_24h,
         cfg.entry_buffer, cfg.exit_buffer,
     )
 
-    # trend_168h: 168h close vs 168h MA — computed on native 168h bars,
+    # trend_168h: 168h close vs 168h MA â€” computed on native 168h bars,
     # then forward-filled to 24h.  This means trend_168h can only change
     # every 168 hours, matching the validated backtest methodology.
     trend_168h_raw = _label_trend_binary(
@@ -213,3 +217,80 @@ def build_24h_signals(
     returns_24h = df_24h['close'].pct_change()
 
     return signals, returns_24h
+
+
+# =============================================================================
+# MONTHLY TREND FILTER
+# =============================================================================
+
+# Validated parameters (Config H — Sharpe 2.07, best risk-adjusted)
+MONTHLY_MA_PERIOD_DEFAULT = 25       # 25-day MA (25 * 24 = 600 hours)
+MONTHLY_UPDATE_FREQ_DEFAULT = '168h' # Weekly re-evaluation
+
+
+def compute_monthly_trend(
+    df_1h: pd.DataFrame,
+    ma_period: int = MONTHLY_MA_PERIOD_DEFAULT,
+    update_freq: str = MONTHLY_UPDATE_FREQ_DEFAULT,
+) -> pd.Series:
+    """
+    Compute monthly trend filter at hourly resolution.
+
+    Matches backtest v05 generate_signals_1h() lines 415–421 exactly.
+    Binary signal: 1 = bullish (price above MA), 0 = bearish.
+
+    Computation:
+        1. Rolling MA on hourly close (period * 24 hours).
+        2. Resample both MA and close to update_freq (168h = weekly).
+        3. Compare close > MA → binary 1/0.
+        4. Forward-fill back to hourly index.
+        5. shift(1) to prevent look-ahead bias.
+        6. fillna(1) — default bullish during warmup.
+
+    Args:
+        df_1h:       Hourly OHLCV DataFrame with DatetimeIndex.
+                     Must contain 'close' column.
+        ma_period:   MA period in days (default: 25 = 600 hours).
+        update_freq: Resampling frequency for trend evaluation
+                     (default: '168h' = weekly).
+
+    Returns:
+        Series on df_1h.index: 1 = bullish, 0 = bearish.
+    """
+    ma_hours = ma_period * 24
+    ma_monthly_hourly = df_1h['close'].rolling(ma_hours).mean()
+
+    # Sample at update frequency
+    ma_at_freq = ma_monthly_hourly.resample(update_freq).last()
+    close_at_freq = df_1h['close'].resample(update_freq).last()
+
+    # Binary comparison → forward-fill to hourly → shift(1)
+    trend_at_freq = (close_at_freq > ma_at_freq).astype(int).dropna()
+    trend_1h = trend_at_freq.reindex(df_1h.index, method='ffill')
+    trend_1h = trend_1h.shift(1).fillna(1).astype(int)
+
+    return trend_1h
+
+
+def get_current_monthly_trend(
+    df_1h: pd.DataFrame,
+    ma_period: int = MONTHLY_MA_PERIOD_DEFAULT,
+    update_freq: str = MONTHLY_UPDATE_FREQ_DEFAULT,
+) -> int:
+    """
+    Get the current monthly trend value for live trading.
+
+    Convenience wrapper around compute_monthly_trend() that returns
+    a single scalar — the most recent trend value. This is what
+    trader.py passes into the features dict for momentum.predict().
+
+    Args:
+        df_1h:       Hourly OHLCV DataFrame with DatetimeIndex.
+        ma_period:   MA period in days (default: 25).
+        update_freq: Resampling frequency (default: '168h').
+
+    Returns:
+        1 = bullish, 0 = bearish.
+    """
+    trend = compute_monthly_trend(df_1h, ma_period, update_freq)
+    return int(trend.iloc[-1])

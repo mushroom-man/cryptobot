@@ -9,24 +9,25 @@ to produce position signals. This is the single strategy entry point for
 both live trading (via trader.py) and backtesting.
 
 Signal Flow:
-    1. regime.classify_bar()     → RegimeState (16-state classification)
-    2. NO_MA72_ONLY filter       → suppress MA72-only transitions
-    3. hit_rates.get_signal()    → +1.0 / -0.5 / 0.0 (direction from hit rates)
-    4. boost check               → S11 ≥ 12h → ×1.5
-    5. quality.compute_scalar()  → scale by dist_ma168
-    6. return SignalResult        → multiplier + metadata
+    1. regime.classify_bar()     â†’ RegimeState (16-state classification)
+    2. NO_MA72_ONLY filter       â†’ suppress MA72-only transitions
+    3. hit_rates.get_signal()    â†’ +1.0 / -0.5 / 0.0 (direction from hit rates)
+    4. boost check               â†’ S11 â‰¥ 12h â†’ Ã—1.5
+    4.5 monthly trend veto       -> bearish monthly -> longs vetoed to flat
+    5. quality.compute_scalar()  â†’ scale by dist_ma168
+    6. return SignalResult        â†’ multiplier + metadata
 
 Config E (Production Reference):
     - MA Periods: 16 / 6 / 2  (24h / 72h / 168h)
-    - Hysteresis: AND-logic, 1.5% entry / 0.5% exit (symmetric ±1.5%)
-    - Confirmation: 0h (removed — raw state = confirmed state)
-    - Boost: State 11 ≥ 12h → 1.5×
+    - Hysteresis: AND-logic, 1.5% entry / 0.5% exit (symmetric Â±1.5%)
+    - Confirmation: 0h (removed â€” raw state = confirmed state)
+    - Boost: State 11 â‰¥ 12h â†’ 1.5Ã—
     - Quality: dist_ma168 linear scalar, 15% dead zone
-    - Short sizing: 0.5× via hit_rates
+    - Short sizing: 0.5Ã— via hit_rates
     - Signal logic: dynamic hit rates (no hardcoded states)
 
 Implements Predictor protocol:
-    predict(features) → SignalResult
+    predict(features) â†’ SignalResult
 
 Usage:
     from cryptobot.strategies.momentum import MomentumStrategy
@@ -42,8 +43,8 @@ Usage:
         'ma_72h': 3100.0,
         'ma_168h': 3050.0,
     })
-    # result.multiplier → +0.85 (long, quality-reduced)
-    # result.direction  → 'LONG'
+    # result.multiplier â†’ +0.85 (long, quality-reduced)
+    # result.direction  â†’ 'LONG'
 """
 
 from dataclasses import dataclass
@@ -66,10 +67,11 @@ class MomentumConfig:
     """
     Immutable momentum strategy configuration.
 
-    Covers boost logic and transition filter. Regime classification
-    (including MA periods and hysteresis buffers), hit rate thresholds,
-    and quality filter parameters are configured via their respective
-    module configs. MA periods live in RegimeConfig (single source of truth).
+    Covers boost logic, transition filter, and monthly veto.
+    Regime classification (including MA periods and hysteresis buffers),
+    hit rate thresholds, and quality filter parameters are configured
+    via their respective module configs. MA periods live in RegimeConfig
+    (single source of truth).
     """
     # Boost (validated Config E)
     boost_state: int = 11
@@ -78,6 +80,12 @@ class MomentumConfig:
 
     # NO_MA72_ONLY filter
     use_signal_filter: bool = True
+
+    # Monthly trend veto (validated Config H — Sharpe 2.07)
+    # When enabled, bearish monthly trend vetoes long positions to flat.
+    # Monthly trend value is computed by features.get_current_monthly_trend()
+    # and passed into predict() via features dict.
+    use_monthly_veto: bool = True
 
 
 # =============================================================================
@@ -93,17 +101,18 @@ class SignalResult:
         multiplier:         Final position multiplier (signed, quality-adjusted).
                             Positive = long, negative = short, zero = flat.
                             Examples: +1.0, +1.5, +0.75, -0.5, -0.35, 0.0
-        state_int:          Active regime state (0–15, post-filter).
+        state_int:          Active regime state (0â€“15, post-filter).
         raw_state_int:      Raw regime state from classifier (pre-filter).
         direction:          Sign of multiplier: +1, -1, or 0.
         hit_rate:           Hit rate for the active state.
         hit_rate_n:         Sample count for the active state.
         hit_rate_sufficient: Whether min sample threshold was met.
         base_signal:        Signal before boost and quality (+1.0 / -0.5 / 0.0).
-        quality_scalar:     Quality scalar applied (0.3–1.0).
+        quality_scalar:     Quality scalar applied (0.3â€“1.0).
         is_boosted:         Whether S11 boost is active.
         duration_hours:     Hours in current active state.
         was_filtered:       True if NO_MA72_ONLY suppressed a transition this bar.
+        monthly_vetoed:     True if long was vetoed by bearish monthly trend.
     """
     multiplier: float
     state_int: int
@@ -117,11 +126,14 @@ class SignalResult:
     is_boosted: bool
     duration_hours: int
     was_filtered: bool
+    monthly_vetoed: bool = False
 
     @property
     def signal_type(self) -> str:
         """Human-readable signal type for reporting."""
-        if self.multiplier == 0:
+        if self.monthly_vetoed:
+            return 'MONTHLY_VETOED'
+        elif self.multiplier == 0:
             return 'FLAT'
         elif self.is_boosted:
             return 'BOOSTED_LONG'
@@ -144,7 +156,7 @@ class _PairTracker:
     previous raw components (for NO_MA72_ONLY filter).
 
     IMPORTANT: Duration tracking is SEPARATED from filter logic,
-    matching backtest v03 lines 988–998. Duration compares the
+    matching backtest v03 lines 988â€“998. Duration compares the
     active_state_int across bars, independent of how the filter
     updated the active components.
     """
@@ -157,7 +169,7 @@ class _PairTracker:
     # Duration: tracks consecutive hours at the same active_state_int
     duration_hours: int = 0
 
-    # Previous RAW components (for NO_MA72_ONLY filter — always updated)
+    # Previous RAW components (for NO_MA72_ONLY filter â€” always updated)
     prev_raw_components: Optional[Tuple[int, int, int, int]] = None
 
     # Boost tracking
@@ -170,7 +182,7 @@ class _PairTracker:
 
 class MomentumStrategy:
     """
-    Momentum strategy — thin wrapper over the shared signal engine.
+    Momentum strategy â€” thin wrapper over the shared signal engine.
 
     Orchestrates regime classification, hit rate lookup, quality
     filtering, boost logic, and the NO_MA72_ONLY transition filter.
@@ -250,8 +262,8 @@ class MomentumStrategy:
         Implements the full signal flow:
             1. Regime classification (with hysteresis)
             2. NO_MA72_ONLY transition filter
-            3. Hit rate lookup → base signal
-            4. Boost check (S11 ≥ 12h)
+            3. Hit rate lookup â†’ base signal
+            4. Boost check (S11 â‰¥ 12h)
             5. Quality filter (dist_ma168 scalar)
 
         Args:
@@ -277,7 +289,7 @@ class MomentumStrategy:
             return self._flat_result(pair)
 
         if ma_72h is None:
-            ma_72h = ma_24h  # degrade gracefully; MA72 comparison → 0
+            ma_72h = ma_24h  # degrade gracefully; MA72 comparison â†’ 0
 
         tracker = self._get_or_create(pair)
 
@@ -290,7 +302,7 @@ class MomentumStrategy:
 
         # =================================================================
         # STEP 2: NO_MA72_ONLY filter
-        # (matches backtest v03 lines 928–956 with confirmation_hours=0)
+        # (matches backtest v03 lines 928â€“956 with confirmation_hours=0)
         #
         # Filter decides whether active_components updates.
         # Duration tracking is SEPARATE (below).
@@ -301,8 +313,8 @@ class MomentumStrategy:
         tracker.prev_raw_components = raw_components
 
         # =================================================================
-        # DURATION TRACKING (matches backtest v03 lines 988–998)
-        # Separated from filter — compares active_state_int across bars.
+        # DURATION TRACKING (matches backtest v03 lines 988â€“998)
+        # Separated from filter â€” compares active_state_int across bars.
         # =================================================================
         current_active_int = _components_to_int(tracker.active_components)
 
@@ -317,13 +329,13 @@ class MomentumStrategy:
             if old_int is not None:
                 logger.info(
                     f"{pair}: state transition "
-                    f"S{old_int} → S{current_active_int}")
+                    f"S{old_int} â†’ S{current_active_int}")
 
         # =================================================================
-        # STEP 3: Hit rate lookup → base signal
+        # STEP 3: Hit rate lookup â†’ base signal
         # =================================================================
         if not self.hit_rates.is_cached(pair):
-            logger.warning(f"{pair}: hit rates not initialised — flat")
+            logger.warning(f"{pair}: hit rates not initialised â€” flat")
             return self._flat_result(pair, tracker=tracker,
                                      raw_state_int=regime.state_int)
 
@@ -332,8 +344,8 @@ class MomentumStrategy:
         base_signal = self.hit_rates.get_signal(pair, active_key)
 
         # =================================================================
-        # STEP 4: Boost (S11 ≥ 12h, long only)
-        # (matches backtest v03 lines 1000–1011)
+        # STEP 4: Boost (S11 â‰¥ 12h, long only)
+        # (matches backtest v03 lines 1000â€“1011)
         # =================================================================
         is_boosted = False
         signal = base_signal
@@ -347,16 +359,37 @@ class MomentumStrategy:
             if not tracker.was_boosted:
                 tracker.was_boosted = True
                 logger.info(
-                    f"{pair}: 🚀 BOOST activated — "
+                    f"{pair}: ðŸš€ BOOST activated â€” "
                     f"S{tracker.active_state_int} "
                     f"@ {tracker.duration_hours}h")
 
         # =================================================================
+        # STEP 4.5: Monthly trend veto (Config H, v05)
+        # Bearish monthly trend -> veto longs to flat.
+        # Shorts pass through unchanged.
+        # Monthly trend is computed by features.get_current_monthly_trend()
+        # and passed in via features dict. Default 1 (bullish) if absent.
+        # =================================================================
+        monthly_vetoed = False
+        if self.config.use_monthly_veto:
+            monthly_trend = features.get('monthly_trend', 1)
+            if monthly_trend == 0 and signal > 0:
+                logger.info(
+                    f"{pair}: MONTHLY VETO - bearish trend, "
+                    f"long signal {signal:+.2f} vetoed to flat")
+                signal = 0.0
+                monthly_vetoed = True
+
+        # =================================================================
         # STEP 5: Quality filter (dist_ma168 scalar)
-        # (matches backtest v03 lines 1037–1052)
+        # (matches backtest v03 lines 1037â€“1052)
+        # Uses 24h bar close (not hourly) to prevent intra-day churn.
+        # Quality scalar should only update when a new 24h bar completes,
+        # matching backtest resolution and preventing unnecessary rebalances.
         # =================================================================
         direction = 1 if signal > 0 else (-1 if signal < 0 else 0)
-        dist_ma168 = self.quality.compute_dist_ma168(price, ma_168h)
+        quality_price = features.get('close_24h', price)  # Fallback to hourly if missing
+        dist_ma168 = self.quality.compute_dist_ma168(quality_price, ma_168h)
         quality_scalar = self.quality.compute_scalar(dist_ma168, direction)
 
         multiplier = signal * quality_scalar
@@ -377,13 +410,14 @@ class MomentumStrategy:
             is_boosted=is_boosted,
             duration_hours=tracker.duration_hours,
             was_filtered=was_filtered,
+            monthly_vetoed=monthly_vetoed,
         )
 
         self._log_signal(pair, result)
         return result
 
     # -----------------------------------------------------------------
-    # NO_MA72_ONLY filter (matches backtest v03 lines 466–485, 928–956)
+    # NO_MA72_ONLY filter (matches backtest v03 lines 466â€“485, 928â€“956)
     # -----------------------------------------------------------------
 
     def _apply_filter(
@@ -400,35 +434,35 @@ class MomentumStrategy:
         Logic (backtest v03, confirmation_hours=0):
             1. First bar (prev is None): initialise active = raw
             2. Raw changed from prev:
-               a. Only MA72 changed → suppress (active unchanged)
-               b. Meaningful transition AND different from active → update active
+               a. Only MA72 changed â†’ suppress (active unchanged)
+               b. Meaningful transition AND different from active â†’ update active
             3. Raw unchanged: do nothing (active unchanged)
         """
         was_filtered = False
 
         if tracker.prev_raw_components is None:
-            # First bar — initialise (backtest line 949–951)
+            # First bar â€” initialise (backtest line 949â€“951)
             tracker.active_components = raw_components
 
         elif raw_components != tracker.prev_raw_components:
-            # Raw state changed — check filter
+            # Raw state changed â€” check filter
             if (self.config.use_signal_filter
                     and _only_ma72_changed(
                         tracker.prev_raw_components, raw_components)):
-                # Suppress: only MA72 changed (backtest line 937–938)
+                # Suppress: only MA72 changed (backtest line 937â€“938)
                 was_filtered = True
                 logger.debug(
-                    f"{tracker.pair}: NO_MA72_ONLY suppressed — "
+                    f"{tracker.pair}: NO_MA72_ONLY suppressed â€” "
                     f"raw S{raw_state_int}, active stays "
                     f"S{tracker.active_state_int}")
 
             elif raw_components != tracker.active_components:
-                # Meaningful transition to a new state (backtest line 939–943)
+                # Meaningful transition to a new state (backtest line 939â€“943)
                 tracker.active_components = raw_components
 
-            # else: filter passed but raw == active — no update needed
+            # else: filter passed but raw == active â€” no update needed
 
-        # else: raw == prev — no transition, active unchanged
+        # else: raw == prev â€” no transition, active unchanged
 
         return was_filtered
 
@@ -446,12 +480,12 @@ class MomentumStrategy:
             - Previous raw state (for NO_MA72_ONLY filter)
 
         DB column mapping (reuses existing schema, no migration):
-            confirmed_state → active_state_int
-            duration_hours  → duration_hours
-            trend_24h       → classifier hysteresis
-            trend_168h      → classifier hysteresis
-            pending_state   → prev_raw_state_int (REPURPOSED)
-            pending_hours   → unused (ignored on load)
+            confirmed_state â†’ active_state_int
+            duration_hours  â†’ duration_hours
+            trend_24h       â†’ classifier hysteresis
+            trend_168h      â†’ classifier hysteresis
+            pending_state   â†’ prev_raw_state_int (REPURPOSED)
+            pending_hours   â†’ unused (ignored on load)
 
         Args:
             db: Database instance.
@@ -488,7 +522,7 @@ class MomentumStrategy:
 
                 loaded += 1
                 logger.info(
-                    f"{pair}: loaded state — S{active_int} "
+                    f"{pair}: loaded state â€” S{active_int} "
                     f"({state_data['duration_hours']}h), "
                     f"t24={state_data['trend_24h']}, "
                     f"t168={state_data['trend_168h']}")
@@ -514,7 +548,7 @@ class MomentumStrategy:
         for pair, tracker in self._trackers.items():
             hysteresis = self.classifier.get_hysteresis(pair)
             if hysteresis is None:
-                logger.warning(f"{pair}: no hysteresis state — skipping save")
+                logger.warning(f"{pair}: no hysteresis state â€” skipping save")
                 continue
 
             trend_24h, trend_168h = hysteresis
@@ -536,7 +570,7 @@ class MomentumStrategy:
             )
             saved += 1
             logger.debug(
-                f"{pair}: saved — S{tracker.active_state_int} "
+                f"{pair}: saved â€” S{tracker.active_state_int} "
                 f"({tracker.duration_hours}h)")
 
         return saved
@@ -622,7 +656,7 @@ class MomentumStrategy:
         else:
             regime = "UNKNOWN"
 
-        return f"{pair}: S{s} ({d}h) → {regime}"
+        return f"{pair}: S{s} ({d}h) â†’ {regime}"
 
     def reset(self, pair: str = None) -> None:
         """Reset state for one pair or all pairs."""
@@ -665,6 +699,7 @@ class MomentumStrategy:
             is_boosted=False,
             duration_hours=tracker.duration_hours if tracker else 0,
             was_filtered=False,
+            monthly_vetoed=False,
         )
 
     @staticmethod
@@ -677,18 +712,19 @@ class MomentumStrategy:
 
     def _log_signal(self, pair: str, result: SignalResult) -> None:
         """Log signal for debugging."""
-        boost = " 🚀" if result.is_boosted else ""
-        filt = " ⚡FILTERED" if result.was_filtered else ""
+        boost = " ðŸš€" if result.is_boosted else ""
+        filt = " âš¡FILTERED" if result.was_filtered else ""
         qual = (f" Q={result.quality_scalar:.2f}"
                 if result.quality_scalar < 1.0 else "")
+        veto = " MONTHLY_VETO" if result.monthly_vetoed else ""
 
         logger.debug(
             f"{pair}: S{result.state_int}({result.duration_hours}h) "
-            f"raw=S{result.raw_state_int} → {result.signal_type} "
+            f"raw=S{result.raw_state_int} â†’ {result.signal_type} "
             f"{result.multiplier:+.3f} "
             f"(base={result.base_signal:+.1f}, "
             f"hr={result.hit_rate:.2f}, n={result.hit_rate_n})"
-            f"{qual}{boost}{filt}")
+            f"{qual}{boost}{filt}{veto}")
 
     def __repr__(self) -> str:
         active = len([
@@ -710,7 +746,7 @@ def _only_ma72_changed(
     """
     Check if MA72 was the sole component that changed.
 
-    Matches backtest v03 lines 476–485 exactly.
+    Matches backtest v03 lines 476â€“485 exactly.
     """
     t24_changed = prev[0] != curr[0]
     t168_changed = prev[1] != curr[1]
@@ -724,13 +760,13 @@ def _only_ma72_changed(
 
 
 def _components_to_int(components: Tuple[int, int, int, int]) -> int:
-    """State integer from component tuple: (t24, t168, ma72, ma168) → 0–15."""
+    """State integer from component tuple: (t24, t168, ma72, ma168) â†’ 0â€“15."""
     return (components[0] * 8 + components[1] * 4
             + components[2] * 2 + components[3])
 
 
 def _int_to_components(state_int: int) -> Tuple[int, int, int, int]:
-    """Component tuple from state integer: 0–15 → (t24, t168, ma72, ma168)."""
+    """Component tuple from state integer: 0â€“15 â†’ (t24, t168, ma72, ma168)."""
     return (
         (state_int >> 3) & 1,
         (state_int >> 2) & 1,

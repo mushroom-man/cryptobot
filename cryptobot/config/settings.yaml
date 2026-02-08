@@ -16,6 +16,14 @@ strategy:
   name: "16state_directional"
   min_training_months: 12
   use_ma72_filter: true
+  
+  # Monthly trend veto (Config H — Sharpe 2.07, best risk-adjusted)
+  # Bearish monthly trend vetoes long positions to flat.
+  # MA(25-day) on hourly close, re-evaluated weekly (168h).
+  monthly_filter:
+    enabled: true
+    ma_period: 25            # Days (25 * 24 = 600 hours)
+    update_freq_hours: 168   # Weekly re-evaluation
 
 # Position sizing
 position:
@@ -62,5 +70,3 @@ notifications:
       - "methebim@gmail.com"
       - "phillipeglezos@hotmail.com"
       - "johnhward2@bigpond.com"
-
-

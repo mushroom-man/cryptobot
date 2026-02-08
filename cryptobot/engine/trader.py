@@ -69,7 +69,8 @@ from cryptobot.reports.weekly_posture import generate_weekly_posture
 
 # Strategy and Executor imports
 from cryptobot.strategies import MomentumStrategy
-from cryptobot.signals.features import build_24h_signals
+from cryptobot.strategies.momentum import MomentumConfig
+from cryptobot.signals.features import build_24h_signals, get_current_monthly_trend
 from cryptobot.signals.regime import RegimeConfig
 from cryptobot.executors import PaperExecutor, LiveExecutor
 from cryptobot.types.bar import Bar
@@ -150,7 +151,7 @@ def load_config(config_path: str = None) -> dict:
     """Load configuration from YAML file."""
     
     if config_path is None:
-        config_path = Path(__file__).parent / "config.yaml"
+        config_path = Path(__file__).parent.parent / "config" / "settings.yaml"
     
     config_path = Path(config_path)
     
@@ -288,8 +289,12 @@ class TradingRunner:
         
         # Initialize strategy
         if strategy_name == 'momentum':
-            self.strategy = MomentumStrategy()
-            self.logger.info(f"Strategy: MomentumStrategy (16-state, dynamic L/S)")
+            monthly_enabled = config.get('strategy', {}).get('monthly_filter', {}).get('enabled', True)
+            momentum_config = MomentumConfig(use_monthly_veto=monthly_enabled)
+            self.strategy = MomentumStrategy(momentum_config=momentum_config)
+            self.logger.info(
+                f"Strategy: MomentumStrategy (16-state, dynamic L/S, "
+                f"monthly_veto={'ON' if monthly_enabled else 'OFF'})")
         else:
             raise ValueError(f"Unknown strategy: {strategy_name}")
         
@@ -443,6 +448,7 @@ class TradingRunner:
                 duration=data['duration'],
                 hit_rate=data.get('hit_rate', 0.5),
                 quality_scalar=data.get('quality_scalar', 0.0),
+                monthly_trend=data.get('monthly_trend', 1),
                 equity=equity,
                 run_time=run_time
             )
@@ -520,32 +526,49 @@ class TradingRunner:
         ma_72h = df_72h['close'].rolling(cfg.ma_period_72h).mean().iloc[-1]
         ma_168h = df_168h['close'].rolling(cfg.ma_period_168h).mean().iloc[-1]
         current_price = df_1h['close'].iloc[-1]
+        close_24h = df_24h['close'].iloc[-1]  # Last completed 24h bar close for quality filter
+        
+        # 2b. Monthly trend (MA25 on hourly, weekly update — matches backtest v05)
+        monthly_cfg = self.config.get('strategy', {}).get('monthly_filter', {})
+        if monthly_cfg.get('enabled', True):
+            monthly_trend = get_current_monthly_trend(
+                df_1h,
+                ma_period=monthly_cfg.get('ma_period', 25),
+                update_freq=f"{monthly_cfg.get('update_freq_hours', 168)}h",
+            )
+        else:
+            monthly_trend = 1  # Default bullish = no veto
         
         # 3. Get signal from strategy
         features = {
             'pair': pair,
             'price': current_price,
+            'close_24h': close_24h,  # Quality scalar uses 24h close to match backtest
             'ma_24h': ma_24h,
             'ma_72h': ma_72h,
             'ma_168h': ma_168h,
+            'monthly_trend': monthly_trend,
         }
         
         result = self.strategy.predict(features)
         
         # 4. Log action
         action_map = {
-            'BOOSTED_LONG': '🚀 BOOSTED LONG (150%)',
-            'LONG':         '✅ LONG (100%)',
-            'SHORT':        '🔻 SHORT',
-            'FLAT':         '⏸️ FLAT',
+            'BOOSTED_LONG':   '🚀 BOOSTED LONG (150%)',
+            'LONG':           '✅ LONG (100%)',
+            'SHORT':          '🔻 SHORT',
+            'FLAT':           '⏸️ FLAT',
+            'MONTHLY_VETOED': '🚫 MONTHLY VETOED',
         }
         action = action_map.get(result.signal_type, f'❓ {result.signal_type}')
+        trend_str = 'BULL' if monthly_trend == 1 else 'BEAR'
         
         self.logger.info(
             f"{pair}: {action} | State={result.state_int}, "
             f"Duration={result.duration_hours}h, "
             f"HR={result.hit_rate:.0%}(n={result.hit_rate_n}), "
-            f"Quality={result.quality_scalar:.2f}"
+            f"Quality={result.quality_scalar:.2f}, "
+            f"Monthly={trend_str}"
         )
         
         return {
@@ -556,6 +579,7 @@ class TradingRunner:
             'duration': result.duration_hours,
             'hit_rate': result.hit_rate,
             'quality_scalar': result.quality_scalar,
+            'monthly_trend': monthly_trend,
         }
     
     def _process_pair_trade(
@@ -568,6 +592,7 @@ class TradingRunner:
         duration: int,
         hit_rate: float,
         quality_scalar: float,
+        monthly_trend: int,
         equity: dict,
         run_time: datetime,
     ):
@@ -594,6 +619,7 @@ class TradingRunner:
             'target_position': target_position,
             'weight': self.risk_parity_weights.get(pair, 0),
             'quality_scalar': quality_scalar,
+            'monthly_trend': monthly_trend,
         })
         
         # Get current position
@@ -993,6 +1019,8 @@ class TradingRunner:
                     status = "✅"
                 elif sig['signal'] == 'SHORT':
                     status = "🔻"
+                elif sig['signal'] == 'MONTHLY_VETOED':
+                    status = "🚫"
                 else:
                     status = "⏸️"
                 self.logger.info(
